@@ -18,7 +18,8 @@ if __name__ == '__main__':
     include_dirs = ['csrc/', f'{nvshmem_dir}/include']
     sources = ['csrc/deep_ep.cpp',
                'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu',
-               'csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu']
+               'csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu',
+               'csrc/kernels/internode_ll_two_stage.cu']
     library_dirs = [f'{nvshmem_dir}/lib']
 
     # Disable aggressive PTX instructions

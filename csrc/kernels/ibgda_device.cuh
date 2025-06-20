@@ -157,7 +157,7 @@ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t *qp, uint64_t base_wqe_idx
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx);
 
     // Always post, not in batch
-    constexpr int kNumRequestInBatch = 4;
+    constexpr int kNumRequestInBatch = 4; // 每4个wqe发送一次
     if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
         ibgda_post_send(qp, new_wqe_idx);
 }
@@ -453,7 +453,7 @@ ibgda_poll_cq(nvshmemi_ibgda_device_cq_t *cq, uint64_t idx) {
     int status = 0;
     struct mlx5_cqe64 *cqe64 = (struct mlx5_cqe64 *)cq->cqe;
 
-    const uint32_t ncqes = cq->ncqes;
+    const uint32_t ncqes = cq->ncqes; // 代表CQ容量
 
     uint16_t wqe_counter;
     uint16_t new_wqe_counter;
@@ -463,7 +463,7 @@ ibgda_poll_cq(nvshmemi_ibgda_device_cq_t *cq, uint64_t idx) {
     do {
         new_wqe_counter = ld_na_relaxed(&cqe64->wqe_counter);
         new_wqe_counter = HtoBE16(new_wqe_counter);
-        wqe_counter = new_wqe_counter;
+        wqe_counter = new_wqe_counter; // 发送结束的个数
     }
     // NOTE: This while loop is part of do while above.
     // wqe_counter is the HW consumer index. However, we always maintain index
@@ -487,8 +487,8 @@ ibgda_poll_cq(nvshmemi_ibgda_device_cq_t *cq, uint64_t idx) {
 // Wait until wqe `idx - 1` is completed.
 __device__ static __forceinline__ void
 nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
-    uint64_t prod_idx = ld_na_relaxed(qp->tx_wq.prod_idx);
+    auto qp = ibgda_get_rc(dst_pe, qp_id); // 到dst pe的第qp id个qp，即src rank与dst rank之间的第qp id个qp
+    uint64_t prod_idx = ld_na_relaxed(qp->tx_wq.prod_idx); // 下一个wqe的id
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
 }
 

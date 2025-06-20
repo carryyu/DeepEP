@@ -111,6 +111,66 @@ struct LowLatencyBuffer {
     }
 };
 
+struct LowLatencyTwoStageLayout {
+    size_t total_bytes = 0;
+    LowLatencyBuffer buffers[2];
+
+    template <typename out_ptr_t = void*, typename count_ptr_t = uint8_t*, typename in_ptr_t = void*>
+    out_ptr_t advance(const in_ptr_t& ptr, size_t count) {
+        return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
+    }
+
+    LowLatencyTwoStageLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk) {
+        const int num_scales = hidden / 128;
+        const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+
+        // Message sizes
+        // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
+        EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
+        size_t num_bytes_per_dispatch_msg = sizeof(int4) + num_topk * 3 * sizeof(int) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
+        size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
+
+        // Send buffer
+        size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
+        size_t combine_send_buffer_bytes = num_rdma_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
+        size_t send_buffer_bytes = std::max(dispatch_send_buffer_bytes, combine_send_buffer_bytes);
+        EP_HOST_ASSERT(send_buffer_bytes % sizeof(int4) == 0);
+        total_bytes += send_buffer_bytes * 2;
+
+        // Symmetric receive buffers
+        // TODO: optimize memory usages
+        size_t dispatch_recv_data_buffer_bytes = num_rdma_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
+        size_t combine_recv_buffer_bytes = num_rdma_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_combine_msg;
+        size_t recv_buffer_bytes = std::max(dispatch_recv_data_buffer_bytes, combine_recv_buffer_bytes);
+        EP_HOST_ASSERT(recv_buffer_bytes % sizeof(int4) == 0);
+        total_bytes += recv_buffer_bytes * 2;
+
+        // Symmetric signaling buffers
+        size_t dispatch_recv_count_buffer_bytes = num_rdma_ranks * sizeof(int);
+        size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
+        size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
+        total_bytes += signaling_buffer_bytes * 2;
+
+        // Assign pointers
+        // NOTES: we still leave some space for distinguishing dispatch/combine buffer,
+        // so you may see some parameters are duplicated
+        for (int i = 0; i < 2; ++ i) {
+            buffers[i] = {
+                static_cast<int>(signaling_buffer_bytes / sizeof(int)),
+                advance(rdma_buffer, send_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
+                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * i), // combine_rdma_send_buffer
+                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i), // combine_rdma_recv_data_buffer
+                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i), // combine_rdma_recv_flag_buffer
+                advance(rdma_buffer, send_buffer_bytes * i),
+                num_bytes_per_combine_msg
+            };
+        }
+    }
+};
+
+
 struct LowLatencyLayout {
     size_t total_bytes = 0;
     LowLatencyBuffer buffers[2];
@@ -164,9 +224,9 @@ struct LowLatencyLayout {
                 advance(rdma_buffer, send_buffer_bytes * i),
                 advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
                 advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * i),
-                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * i), // combine_rdma_send_buffer
+                advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i), // combine_rdma_recv_data_buffer
+                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i), // combine_rdma_recv_flag_buffer
                 advance(rdma_buffer, send_buffer_bytes * i),
                 num_bytes_per_combine_msg
             };
@@ -177,6 +237,24 @@ struct LowLatencyLayout {
 size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
     auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
+}
+
+size_t get_low_latency_rdma_size_hint_two_stage(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk) {
+    auto rdma_num_bytes = LowLatencyTwoStageLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, num_topk).total_bytes;
+    return ((rdma_num_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
+}
+
+size_t get_low_latency_nvl_size_hint_two_stage(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk, bool use_fp8) {
+    const int num_local_experts = num_experts / num_ranks;
+    const int num_rdma_experts = num_local_experts * NUM_MAX_NVL_PEERS;
+    const int num_scales = hidden / 128;
+    const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    const size_t dispatch_num_bytes_per_msg = sizeof(int4) + (use_fp8 ? (hidden + num_scales * sizeof(float)) : (hidden * sizeof(nv_bfloat16)));
+    auto dispatch_nvl_num_bytes = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * dispatch_num_bytes_per_msg + num_local_experts * num_ranks * sizeof(int);
+    const size_t combine_num_bytes_per_msg = hidden * sizeof(nv_bfloat16);
+    auto combine_nvl_num_bytes = num_rdma_experts * num_rdma_ranks * num_max_dispatch_tokens_per_rank * combine_num_bytes_per_msg + num_rdma_experts * num_rdma_ranks * sizeof(int);
+    auto nvl_num_bytes = std::max(dispatch_nvl_num_bytes, combine_nvl_num_bytes);
+    return ((nvl_num_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
 } // namespace deep_ep

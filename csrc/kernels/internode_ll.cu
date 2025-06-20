@@ -140,6 +140,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
+                // 如果dst expert idx都位于同一个rank上，这里会通过rdma/nvlink发送多次，
+                // 比如0 1 2，会通过rdma/nvlink重复发3次当前token到目标rank
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
@@ -214,6 +216,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
+        // 确保发到这个专家的token发完了
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
@@ -462,7 +465,7 @@ combine(void* combined_x,
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
-    if (thread_id < hidden_bf16_int4) {
+    if (thread_id < hidden_bf16_int4) { // !!! for loop, now just supports max hidden size 8192
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];

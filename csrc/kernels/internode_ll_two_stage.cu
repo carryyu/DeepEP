@@ -238,14 +238,8 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         int dst_rdma_rank = sm_id - 1;
         const auto num_tokens_sent = shared_num_tokens_per_rdma[dst_rdma_rank];
         
-        // init atomic_counter_per_expert
-        if (sm_id == 1) {
-            for (int i = thread_id; i < kNumLocalExperts; i += num_threads) {
-                packed_recv_count[i] = 0;
-            }
-        }
         if (thread_id == 0) {
-            // 确保init和发送完成
+            // 确保init和发送处理完成
             while (ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank) != FINISHED_SUM_TAG * 2);
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + rdma_rank); // 发到其他机器的rdma rank位置上，代表从rdma rank收到多少token
             // printf("src_rank: %d send msg to dst_rank: %d, num_tokens_sent: %d\n", rank, dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, num_tokens_sent);
@@ -257,14 +251,20 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 dst_rdma_rank == rdma_rank); // local_copy?
             
             // clean
+            atomic_counter_per_rdma[dst_rdma_rank] = 0;
+            atomic_finished_counter_per_rdma[dst_rdma_rank] = 0;  
+        }
+        __syncthreads();
+        // init packed_recv_count
+        if (sm_id == kNumRdmaRanks) {
             for (int i = thread_id; i < kNumExperts; i += num_threads) {
                 atomic_counter_per_expert[i] = 0;
+                if (i < kNumLocalExperts) {
+                    packed_recv_count[i] = 0;
+                }
             }
-            atomic_counter_per_rdma[dst_rdma_rank] = 0;
-            atomic_finished_counter_per_rdma[dst_rdma_rank] = 0;   
         }
     }
-    __syncthreads();
 
     /* RDMA Receiver and NVL Sender */
     // 轮询rdma_recv_count，确保当前rank从src rdma rank接收token完成
@@ -371,8 +371,10 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
-            // reset
+            // reset atomic_recv_tokens_per_rdma_expert
             responsible_expert_idx < kNumRdmaExperts ? atomic_recv_tokens_per_rdma_expert[responsible_expert_idx] = 0 : 0;
+            // reset nvl_recv_token_num
+            *(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES) + local_expert_idx * kNumRanks + src_rank) = 0;
         }
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
@@ -521,18 +523,6 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
     const size_t NVL_BUFFER_X_BYTES = kNumRdmaExperts * kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
 
-    // Clean up next buffer
-    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
-        #pragma unroll
-        for (int i = lane_id; i < num_next_clean_int; i += 32)
-            next_clean[i] = 0;
-
-        // Notify before executing `int_p`
-        __syncwarp();
-        if (lane_id == 0)
-            atomic_add_release_global(atomic_clean_flag, num_experts);
-    }
-
     // nvl sender
     // 从不同的rank发到本地rank的token，原路返回，先发回本地源rank的rdma buffer中
     if (responsible_expert_idx < num_experts) {
@@ -566,11 +556,12 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
         if (sub_warp_id == 1 and lane_id == 0) {
-            while (ld_acquire_global(atomic_clean_flag) == 0);
+            // wait clean done
+            // while (ld_acquire_global(atomic_clean_flag) == 0);
             auto dst_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[dst_nvl_rank]) + NVL_BUFFER_X_BYTES) + global_rdma_expert_idx * kNumRdmaRanks + dst_rdma_rank;
             st_release_sys_global(dst_ptr, 1);
-            // 重置atomic_clean_flag
-            atomic_add_release_global(atomic_clean_flag, -1);
+            // // 重置atomic_clean_flag
+            // atomic_add_release_global(atomic_clean_flag, -1);
         }
         __syncwarp();
     }
@@ -578,8 +569,11 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     // Wait all nvl ranks to arrive
     if (responsible_expert_idx < num_experts) {
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
-        if (sub_warp_id == 0 and lane_id == 0)
+        if (sub_warp_id == 0 and lane_id == 0) {
             while (ld_acquire_sys_global(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES) + responsible_expert_idx) == 0);
+            // reset nvl_recv_buffer
+            *(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES) + responsible_expert_idx) = 0;
+        }
     }
     cg::this_grid().sync();
     // nvl receiver / nvl reducer
@@ -646,17 +640,17 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                 }
                 __syncwarp();
             }
-            thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + deal_rdma_rank, 1)) : 0;
         }
+        thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + deal_rdma_rank, 1)) : 0;
         // all sms reduce done
-        if (thread_id == 0) {
-            while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != num_tokens_to_deal);
+        if (nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
+            while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != sms_per_rdma);
         }
         __syncthreads();
         // set flag
         if (sub_deal_rdma_rank == 0 && warp_id == 0) {
             // notify remote rdma
-            if (thread_id == 0) {
+            if (lane_id == 0) {
                 auto dst_rdma_flag = reinterpret_cast<uint64_t>(rdma_recv_flag + rdma_rank);
                 nvshmemi_ibgda_amo_nonfetch_add(
                     reinterpret_cast<int*>(dst_rdma_flag), // rptr
@@ -664,41 +658,49 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
                     deal_rdma_rank,  // qp_id
                     deal_rdma_rank == rdma_rank); // local_copy?
+                // atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0;
             }
         }
+    }
+    // // rdma revecier and reducer
+    // // Wait all rdma ranks to arrive
+    // if (sm_id < kNumRdmaRanks) {
+    //     if (warp_id == 0 and lane_id == 0)
+    //         while (ld_acquire_sys_global(rdma_recv_flag + sm_id) == 0);
+    // }
+    // cg::this_grid().sync();
 
-    }
-    // rdma revecier and reducer
-    // Wait all rdma ranks to arrive
-    if (sm_id < kNumRdmaRanks) {
-        if (warp_id == 0 and lane_id == 0)
-            while (ld_acquire_sys_global(rdma_recv_flag + sm_id) == 0);
-    }
-    cg::this_grid().sync();
-    if (thread_id < hidden_bf16_int4) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-            float combined_values[kNumElemsPerInt4] = {0.0f};
-            const bool *rdma_send_flags_now = rdma_send_flags + token_idx * kNumRdmaRanks;
-            for (int rdma_rank_idx = 0; rdma_rank_idx < kNumRdmaRanks; ++rdma_rank_idx) {
-                if (rdma_send_flags_now[rdma_rank_idx]) {
-                    // 说明传到了对应rdma上，累加结果
-                    const int4* src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_recv_x) + (rdma_rank_idx * num_max_dispatch_tokens_per_rank + token_idx) * combine_hidden_bytes);
-                    auto x_vec = ld_nc_global(src_ptr + thread_id);
-                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                        combined_values[j] += static_cast<float>(x_bf16[j]);
-                }
-            }
-            // Write results
-            int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
-            auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
-            #pragma unroll
-            for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-            (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
-        }
-    }
+    // // Clean up next buffer
+    // if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+    //     #pragma unroll
+    //     for (int i = lane_id; i < num_next_clean_int; i += 32)
+    //         next_clean[i] = 0;
+    // }
+
+    // if (thread_id < hidden_bf16_int4) {
+    //     for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+    //         float combined_values[kNumElemsPerInt4] = {0.0f};
+    //         const bool *rdma_send_flags_now = rdma_send_flags + token_idx * kNumRdmaRanks;
+    //         for (int rdma_rank_idx = 0; rdma_rank_idx < kNumRdmaRanks; ++rdma_rank_idx) {
+    //             if (rdma_send_flags_now[rdma_rank_idx]) {
+    //                 // 说明传到了对应rdma上，累加结果
+    //                 const int4* src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_recv_x) + (rdma_rank_idx * num_max_dispatch_tokens_per_rank + token_idx) * combine_hidden_bytes);
+    //                 auto x_vec = ld_nc_global(src_ptr + thread_id);
+    //                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
+    //                 #pragma unroll
+    //                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
+    //                     combined_values[j] += static_cast<float>(x_bf16[j]);
+    //             }
+    //         }
+    //         // Write results
+    //         int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
+    //         auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
+    //         #pragma unroll
+    //         for (int j = 0; j < kNumElemsPerInt4; ++ j)
+    //             combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
+    //         (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+    //     }
+    // }
 }
 
 void combine(void* combined_x,

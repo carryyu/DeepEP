@@ -667,8 +667,9 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        src_info, layout_range, rdma_send_flags, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
+        # src_info, layout_range, rdma_send_flags, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        src_info, layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        combined_x, event, hook = self.runtime.low_latency_combine_two_stage(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    rdma_send_flags, num_max_dispatch_tokens_per_rank, num_experts,
                                                                    dispatch_use_fp8, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)

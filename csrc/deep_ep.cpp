@@ -1246,7 +1246,7 @@ Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tenso
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
 
     // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    LowLatencyTwoStageLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, num_topk);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto dispatch_buffer = layout.buffers[low_latency_buffer_idx ^ 1];
     auto buffer = layout.buffers[low_latency_buffer_idx];

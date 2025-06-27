@@ -43,6 +43,13 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    // if (rdma_rank == 0 && nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
+    //     printf("rdma_recv_count: %p\n", rdma_recv_count);
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         printf("rdma_recv_count[%d]: %d\n", i, rdma_recv_count[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -242,13 +249,27 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             // 确保init和发送处理完成
             while (ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank) != FINISHED_SUM_TAG * 2);
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + rdma_rank); // 发到其他机器的rdma rank位置上，代表从rdma rank收到多少token
-            // printf("src_rank: %d send msg to dst_rank: %d, num_tokens_sent: %d\n", rank, dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, num_tokens_sent);
-            nvshmemi_ibgda_amo_nonfetch_add(
-                reinterpret_cast<int*>(dst_ptr), // rptr
-                -num_tokens_sent - 1, // value
-                dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
-                dst_rdma_rank,  // qp_id
-                dst_rdma_rank == rdma_rank); // local_copy?
+
+            bool is_local_copy = dst_rdma_rank == rdma_rank;
+            // printf("is_local_copy: %d\n", (int)is_local_copy);
+            // printf("rdma_recv_count old: %d\n", rdma_recv_count[rdma_rank]);
+            if (is_local_copy) { // local copy
+                // atomicAdd(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
+                st_na_release(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
+            } else {
+                nvshmemi_ibgda_amo_nonfetch_add(
+                    reinterpret_cast<int*>(dst_ptr), // rptr
+                    -num_tokens_sent - 1, // value
+                    dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
+                    dst_rdma_rank); // qp_id
+            }
+            // nvshmemi_ibgda_amo_nonfetch_add(
+            //     reinterpret_cast<int*>(dst_ptr), // rptr
+            //     -num_tokens_sent - 1, // value
+            //     dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
+            //     dst_rdma_rank,  // qp_id
+            //     is_local_copy); // local_copy?
+            // printf("rdma_recv_count new: %d\n", rdma_recv_count[rdma_rank]);
             
             // clean
             atomic_counter_per_rdma[dst_rdma_rank] = 0;
@@ -326,7 +347,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + src_rdma_rank, 1)) : 0;
         // 确保所有sm处理完
-        if (sub_rdma_rank == 0 && thread_id == 0) {
+        if (thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + src_rdma_rank) != sms_per_rdma);
         }
         __syncthreads();
@@ -503,7 +524,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
 
     const size_t dispatch_hidden_bytes = kHidden * (kDispatchUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t combine_hidden_bytes = kHidden * sizeof(nv_bfloat16);
-    const size_t combine_hidden_int4_num = combine_hidden_bytes * sizeof(int4);
+    const size_t combine_hidden_int4_num = combine_hidden_bytes / sizeof(int4);
 
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -516,6 +537,13 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    // if (rdma_rank == 0 && nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
+    //     printf("rdma recv flag: %p\n", rdma_recv_flag);
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         printf("rdma_recv_flag[%d]: %d\n", i, rdma_recv_flag[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
 
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     const size_t hidden_bf16_int4 = kHidden / kNumElemsPerInt4;
@@ -582,7 +610,10 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         const int sms_per_rdma = num_sms / kNumRdmaRanks; // 多少个sms一起处理一个rdma ranks
         const int deal_rdma_rank = sm_id / sms_per_rdma; // 代表从哪个rdma rank收到的
         const int sub_deal_rdma_rank = sm_id % sms_per_rdma;
-        const int num_tokens_to_deal = dispatch_rdma_recv_count[deal_rdma_rank];
+        const int num_tokens_to_deal = (-dispatch_rdma_recv_count[deal_rdma_rank] - 1);
+        // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
+        //     printf("num_tokens_to_deal: %d\n", num_tokens_to_deal);
+        // }
         const auto dispatch_rdma_recv_x_this_rdma_rank = reinterpret_cast<uint8_t*>(dispatch_rdma_recv_x) + 
                                                          deal_rdma_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_dispatch;
         auto rdma_send_x_this_rdma_rank = reinterpret_cast<uint8_t*>(rdma_send_x) + 
@@ -601,6 +632,10 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     const int dst_rdma_expert_idx = nvl_rank_meta[nvl_rank_idx * 3];
                     const int dst_cum_index = nvl_rank_meta[nvl_rank_idx * 3 + 1];
                     const float topk_weight = reinterpret_cast<const float*>(nvl_rank_meta)[nvl_rank_idx * 3 + 2];
+                    // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
+                    //     printf("nvl_rank_nums: %d, nvl_rank_idx: %d, token_id: %d, dst_rdma_expert_idx: %d, dst_cum_index: %d, topk_weight: %f\n", 
+                    //             nvl_rank_nums, nvl_rank_idx, rdma_recv_token_idx, dst_rdma_expert_idx, dst_cum_index, topk_weight);   
+                    // }
                     const int4 *src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + 
                                           ((dst_rdma_expert_idx * kNumRdmaRanks + deal_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_cum_index) * num_bytes_per_slot);
                     // reduce
@@ -609,6 +644,13 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     #pragma unroll
                     for (int j = 0; j < kNumElemsPerInt4; ++ j)
                         combined_values[j] += static_cast<float>(x_bf16[j]) * topk_weight;
+                    // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
+                    //     printf("combined_value: \n");
+                    //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
+                    //         printf("%f * %f = %f, cumsum: %f\n", 
+                    //                 static_cast<float>(x_bf16[j]), topk_weight, static_cast<float>(x_bf16[j]) * topk_weight, combined_values[j]);
+                    //     }
+                    // }
                 }
                 int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
                 auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
@@ -616,6 +658,13 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
                     combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
                 dst_ptr[thread_id] = combined_int4;
+                // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
+                //     printf("dst_ptr: \n");
+                //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
+                //         printf("dst_ptr[%d]: %f\n", 
+                //                 j, static_cast<float>(reinterpret_cast<nv_bfloat16*>(&dst_ptr[thread_id])[j]));
+                //     }
+                // }
             }
             // 确保该token处理完成
             __syncthreads();
@@ -643,64 +692,95 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + deal_rdma_rank, 1)) : 0;
         // all sms reduce done
-        if (nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
+        if (thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != sms_per_rdma);
         }
         __syncthreads();
         // set flag
-        if (sub_deal_rdma_rank == 0 && warp_id == 0) {
+        if (sub_deal_rdma_rank == 0 && thread_id == 0) {
             // notify remote rdma
-            if (lane_id == 0) {
-                auto dst_rdma_flag = reinterpret_cast<uint64_t>(rdma_recv_flag + rdma_rank);
+            auto dst_rdma_flag = reinterpret_cast<uint64_t>(rdma_recv_flag + rdma_rank);
+            bool is_local_copy = deal_rdma_rank == rdma_rank;
+            if (is_local_copy) { // local copy
+                // printf("rank: %d, rdma_recv_flag old: %d\n", nvl_rank, rdma_recv_flag[rdma_rank]);
+                // int old = atomicAdd(rdma_recv_flag + rdma_rank, 1);
+                st_na_release(rdma_recv_flag + rdma_rank, 1);
+                // printf("old: %d\n", old);
+                // printf("rank: %d, rdma_recv_flag new: %d\n", nvl_rank, rdma_recv_flag[rdma_rank]);
+            } else {
                 nvshmemi_ibgda_amo_nonfetch_add(
                     reinterpret_cast<int*>(dst_rdma_flag), // rptr
                     1, // value
                     deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
-                    deal_rdma_rank,  // qp_id
-                    deal_rdma_rank == rdma_rank); // local_copy?
-                // atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0;
+                    deal_rdma_rank); // qp_id
             }
+            atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0;
         }
     }
-    // // rdma revecier and reducer
-    // // Wait all rdma ranks to arrive
-    // if (sm_id < kNumRdmaRanks) {
-    //     if (warp_id == 0 and lane_id == 0)
-    //         while (ld_acquire_sys_global(rdma_recv_flag + sm_id) == 0);
-    // }
-    // cg::this_grid().sync();
+    // rdma revecier and reducer
+    // Wait all rdma ranks to arrive
+    if (sm_id < kNumRdmaRanks) {
+        if (warp_id == 0 and lane_id == 0)
+            while (ld_acquire_sys_global(rdma_recv_flag + sm_id) == 0);
+    }
+    cg::this_grid().sync();
 
-    // // Clean up next buffer
-    // if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
-    //     #pragma unroll
-    //     for (int i = lane_id; i < num_next_clean_int; i += 32)
-    //         next_clean[i] = 0;
-    // }
+    // Clean up next buffer
+    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+        #pragma unroll
+        for (int i = lane_id; i < num_next_clean_int; i += 32)
+            next_clean[i] = 0;
+    }
 
-    // if (thread_id < hidden_bf16_int4) {
-    //     for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-    //         float combined_values[kNumElemsPerInt4] = {0.0f};
-    //         const bool *rdma_send_flags_now = rdma_send_flags + token_idx * kNumRdmaRanks;
-    //         for (int rdma_rank_idx = 0; rdma_rank_idx < kNumRdmaRanks; ++rdma_rank_idx) {
-    //             if (rdma_send_flags_now[rdma_rank_idx]) {
-    //                 // 说明传到了对应rdma上，累加结果
-    //                 const int4* src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_recv_x) + (rdma_rank_idx * num_max_dispatch_tokens_per_rank + token_idx) * combine_hidden_bytes);
-    //                 auto x_vec = ld_nc_global(src_ptr + thread_id);
-    //                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
-    //                 #pragma unroll
-    //                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
-    //                     combined_values[j] += static_cast<float>(x_bf16[j]);
-    //             }
-    //         }
-    //         // Write results
-    //         int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
-    //         auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
-    //         #pragma unroll
-    //         for (int j = 0; j < kNumElemsPerInt4; ++ j)
-    //             combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-    //         (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
-    //     }
-    // }
+    if (thread_id < hidden_bf16_int4) {
+        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+            float combined_values[kNumElemsPerInt4] = {0.0f};
+            const bool *rdma_send_flags_now = rdma_send_flags + token_idx * kNumRdmaRanks;
+            for (int rdma_rank_idx = 0; rdma_rank_idx < kNumRdmaRanks; ++rdma_rank_idx) {
+                // if (nvl_rank == 0 && sm_id == 0 && thread_id == 0) {
+                //     printf("token_idx: %d, num_combined_tokens: %d, hidden_bf16_int4: %d, rdma_send_flags_now: %d\n", token_idx, num_combined_tokens, hidden_bf16_int4, (int)rdma_send_flags_now[rdma_rank_idx]);
+                // }
+                if (rdma_send_flags_now[rdma_rank_idx]) {
+                    // 说明传到了对应rdma上，累加结果
+                    const int4* src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(rdma_recv_x) + 
+                                          (rdma_rank_idx * num_max_dispatch_tokens_per_rank + token_idx) * combine_hidden_bytes);
+                    auto x_vec = ld_nc_global(src_ptr + thread_id);
+                    const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
+                    // if (sm_id == 0 && thread_id == 0) {
+                    //     printf("x_vec:\n");
+                    //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
+                    //         printf("x_vec[%d]: %f\n", 
+                    //                 j, static_cast<float>(x_bf16[j]));
+                    //     }
+                    // }
+                    #pragma unroll
+                    for (int j = 0; j < kNumElemsPerInt4; ++ j)
+                        combined_values[j] += static_cast<float>(x_bf16[j]);
+                }
+            }
+            // Write results
+            int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
+            auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
+            #pragma unroll
+            for (int j = 0; j < kNumElemsPerInt4; ++ j)
+                combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
+            // if (nvl_rank == 0 && sm_id == 0 && thread_id == 0) {
+            //     printf("token_idx: %d, combined_bf16:\n", token_idx);
+            //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
+            //         printf("combined_bf16[%d]: %f\n", 
+            //                 j, static_cast<float>(combined_bf16[j]));
+            //     }
+            // }
+            (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+            // if (nvl_rank == 0 && sm_id == 0 && thread_id == 0) {
+            //     printf("token_idx: %d, res:\n", token_idx);
+            //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
+            //         printf("res[%d]: %f\n", 
+            //                 j, static_cast<float>(reinterpret_cast<nv_bfloat16*>((reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + thread_id))[j]));
+            //     }
+            // }
+        }
+    }
 }
 
 void combine(void* combined_x,

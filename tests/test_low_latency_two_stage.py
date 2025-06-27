@@ -24,6 +24,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
+    # print("topk_weights: ", topk_weights)
 
     # Randomly mask some positions
     for i in range(10):
@@ -39,7 +40,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             if (rank == 0):
                 print("-------------------input-------------------")
                 print("x: ", x.dtype, x.shape, x)
-                print(f"rank: {rank}, topk_idx: {topk_idx.dtype, topk_idx.shape, topk_idx}", flush=True)
+                print(f"rank: {rank}, topk_idx: {topk_idx.dtype, topk_idx.shape, topk_idx}, topk_weights: {topk_weights.dtype, topk_weights.shape, topk_weights}", flush=True)
                 # tmp_topk = topk_idx == -1
                 # print(f"rank {rank}, total token: {(tmp_topk.sum(axis=1) == 8).sum()}", flush=True)
                 # print("num_tokens: ", num_tokens)
@@ -61,30 +62,38 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             torch.cuda.synchronize()
             group.barrier()
             if rank == 0:
-                if dispatch_use_fp8:
-                    print(f"rank: {rank}, packed_recv_x: {packed_recv_x[0].shape, packed_recv_x[0].dtype, packed_recv_x[0]}, packed_recv_scale: {packed_recv_x[1].shape, packed_recv_x[1].dtype, packed_recv_x[1]}, packed_recv_x: {packed_recv_count}", flush=True)
-                    print(f"rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags}")
-                    for rank_i in range(num_local_experts):
-                        print(f"local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[0][rank_i][:(packed_recv_count[rank_i] + 1)]}, recv_scale: {packed_recv_x[1][rank_i][:(packed_recv_count[rank_i] + 1)]}")
-                else:
-                    print(f"rank: {rank}, packed_recv_x: {packed_recv_x.shape, packed_recv_x.dtype, packed_recv_x}, packed_recv_x: {packed_recv_count}", flush=True)
-                    for rank_i in range(num_local_experts):
-                        print(f"local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[rank_i][:(packed_recv_count[rank_i] + 1)]}")
+            # if True:
                 src_info, layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-                print(f"src_info: {src_info.shape, src_info}")
-                print(f"layout_range: {layout_range.shape, layout_range}")
-                print(f"rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags.reshape([-1])}")
-                print(f"dispatch_rdma_recv_tensor: {dispatch_rdma_recv_tensor.shape, dispatch_rdma_recv_tensor[8:, -48:]}")
-                print(f"dispatch_rdma_recv_count_tensor: {dispatch_rdma_recv_count_tensor.shape, dispatch_rdma_recv_count_tensor}")
-                print(f"num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}, hidden: {hidden}, num_experts: {num_experts}")
+                if dispatch_use_fp8:
+                    print("packed_recv_x: ", packed_recv_x[0])
+                    print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags}")
+                    for rank_i in range(num_local_experts):
+                        print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[0][rank_i][:(packed_recv_count[rank_i] + 1)]}, recv_scale: {packed_recv_x[1][rank_i][:(packed_recv_count[rank_i] + 1)]}")
+                        # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
+                else:
+                    print("packed_recv_x: ", packed_recv_x)
+                    for rank_i in range(num_local_experts):
+                        print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[rank_i][:(packed_recv_count[rank_i] + 1)]}")
+                        # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
+                print(f"rank: {rank}, layout_range: {layout_range.shape, layout_range}")
+                print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags.reshape([-1])}")
+                print(f"rank: {rank}, dispatch_rdma_recv_tensor: {dispatch_rdma_recv_tensor.shape, dispatch_rdma_recv_tensor[:, 8:-48]}")
+                print(f"rank: {rank}, dispatch_rdma_recv_count_tensor: {dispatch_rdma_recv_count_tensor.shape, dispatch_rdma_recv_count_tensor}")
+                print(f"rank: {rank}, num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}, hidden: {hidden}, num_experts: {num_experts}")
             
             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                 if dispatch_use_fp8 else packed_recv_x.clone()
-            # combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
-            #                                                         async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
-            #                                                         return_recv_hook=return_recv_hook, out=out)
-            
+            if rank == 0:
+                print('-------------------simulated_gemm_x-------------------')
+                print(f"rank: {rank}, simulated_gemm_x: {simulated_gemm_x.dtype, simulated_gemm_x.shape, simulated_gemm_x}", flush=True)
+                print('-------------------end-------------------')
+            combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                    async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
+                                                                    return_recv_hook=return_recv_hook, out=out)
+            if rank == 0:
+                print(f"rank: {rank}, combined_x: {combined_x.dtype, combined_x.shape, combined_x}", flush=True)
+                print(f"rank: {rank}, combined_x: {out.dtype, out.shape, out}", flush=True)
     return hash_value
 
 

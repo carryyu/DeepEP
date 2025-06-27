@@ -251,8 +251,6 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + rdma_rank); // 发到其他机器的rdma rank位置上，代表从rdma rank收到多少token
 
             bool is_local_copy = dst_rdma_rank == rdma_rank;
-            // printf("is_local_copy: %d\n", (int)is_local_copy);
-            // printf("rdma_recv_count old: %d\n", rdma_recv_count[rdma_rank]);
             if (is_local_copy) { // local copy
                 // atomicAdd(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
                 st_na_release(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
@@ -263,14 +261,6 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                     dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
                     dst_rdma_rank); // qp_id
             }
-            // nvshmemi_ibgda_amo_nonfetch_add(
-            //     reinterpret_cast<int*>(dst_ptr), // rptr
-            //     -num_tokens_sent - 1, // value
-            //     dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
-            //     dst_rdma_rank,  // qp_id
-            //     is_local_copy); // local_copy?
-            // printf("rdma_recv_count new: %d\n", rdma_recv_count[rdma_rank]);
-            
             // clean
             atomic_counter_per_rdma[dst_rdma_rank] = 0;
             atomic_finished_counter_per_rdma[dst_rdma_rank] = 0;  
@@ -295,7 +285,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     // if (sm_id < kNumRdmaRanks) {
     {
         const int sms_per_rdma = num_sms / kNumRdmaRanks; // 多少个sms一起处理一个rdma ranks
-        const int src_rdma_rank = sm_id / sms_per_rdma;
+        const int src_rdma_rank = sm_id / sms_per_rdma; // 处理收到的那个rdma rank的数据
         const int sub_rdma_rank = sm_id % sms_per_rdma;
 
         const int src_rank = src_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
@@ -313,7 +303,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         }
         __syncthreads();
         num_recv_tokens_per_rdma = shared_num_recv_tokens[0];
-        // 先拷贝到nvl buffer，记录当前rank到目标专家的累计拷贝数量，这里后续使用多个sm传输一个src rdma rank发来的数据
+        // 先拷贝到nvl buffer，记录当前rank到目标专家的累计拷贝数量，使用多个sm传输一个src rdma rank发来的数据
         // 某个token发到了哪几个nvl rank的哪个位置，以及在rdma rank上的位置是哪里
         for (int rdma_recv_token_idx = sub_rdma_rank; rdma_recv_token_idx < num_recv_tokens_per_rdma; rdma_recv_token_idx += sms_per_rdma) {
             // index_source, nvl_num, hidden, (scale), nvl_rank0, dst_idx0, ..., nvl_rank7, dst_idx7
@@ -342,12 +332,12 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 }
                 UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
                 // 累加当前sm负责的src rank发到目标专家的token数量
-                lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + rdma_local_expert_idx, 1)) : 0;
+                lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
             }
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + src_rdma_rank, 1)) : 0;
         // 确保所有sm处理完
-        if (thread_id == 0) {
+        if (sub_rdma_rank == 0 && thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + src_rdma_rank) != sms_per_rdma);
         }
         __syncthreads();
@@ -358,7 +348,9 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 const int dst_nvl_local_expert = dst_rdma_local_expert_idx % kNumLocalExperts;
                 st_release_sys_global(
                     reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[dst_nvl_rank]) + NVL_BUFFER_X_BYTES) + dst_nvl_local_expert * kNumRanks + src_rank, 
-                    -ld_acquire_global(atomic_recv_tokens_per_rdma_expert + dst_rdma_local_expert_idx) - 1);
+                    -ld_acquire_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + dst_rdma_local_expert_idx) - 1);
+                // reset
+                *(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + dst_rdma_local_expert_idx) = 0;
             }
             // reset
             thread_id == 0 ? atomic_nvl_sender_multi_sms[src_rdma_rank] = 0 : 0;
@@ -392,8 +384,6 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
-            // reset atomic_recv_tokens_per_rdma_expert
-            responsible_expert_idx < kNumRdmaExperts ? atomic_recv_tokens_per_rdma_expert[responsible_expert_idx] = 0 : 0;
             // reset nvl_recv_token_num
             *(reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES) + local_expert_idx * kNumRanks + src_rank) = 0;
         }
@@ -465,7 +455,7 @@ void dispatch(void* packed_recv_x,
     auto atomic_counter_per_rdma = atomic_counter_per_expert + num_experts;
     auto atomic_finished_counter_per_rdma = atomic_counter_per_rdma + num_rdma_ranks;
     auto atomic_recv_tokens_per_rdma_expert = atomic_finished_counter_per_rdma + num_rdma_ranks;
-    auto atomic_nvl_sender_multi_sms = atomic_recv_tokens_per_rdma_expert + num_rdma_experts; // num_rdma_ranks
+    auto atomic_nvl_sender_multi_sms = atomic_recv_tokens_per_rdma_expert + num_rdma_ranks * num_rdma_experts; // num_rdma_ranks
     EP_HOST_ASSERT((num_experts + num_rdma_ranks * 3 + num_rdma_experts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
 
     DISPATCH_HIDDEN_SIZE(hidden, kHidden, {
@@ -692,7 +682,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + deal_rdma_rank, 1)) : 0;
         // all sms reduce done
-        if (thread_id == 0) {
+        if (sub_deal_rdma_rank == 0 && thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != sms_per_rdma);
         }
         __syncthreads();

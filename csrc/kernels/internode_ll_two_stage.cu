@@ -44,13 +44,6 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
-    // if (rdma_rank == 0 && nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
-    //     printf("rdma_recv_count: %p\n", rdma_recv_count);
-    //     for (int i = 0; i < kNumRdmaRanks; i++) {
-    //         printf("rdma_recv_count[%d]: %d\n", i, rdma_recv_count[i]);
-    //     }
-    // }
-    // cg::this_grid().sync();
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -443,16 +436,21 @@ void dispatch(void* packed_recv_x,
               void* workspace, 
               cudaStream_t stream, 
               int phases) {
-    constexpr int kNumMaxTopK = 9;
-    constexpr int kNumWarpsPerGroup = 10;
-    constexpr int kNumWarpGroups = 3;
+    constexpr int kNumMaxTopK = 8;
+    constexpr int kNumWarpsPerGroup = 32;
+    constexpr int kNumWarpGroups = 1;
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-    const auto num_sms = cell_div(num_experts, kNumWarpGroups); // !!!
+    const int dev_id = 0;
+    int sm_count;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id);
+    const auto num_sms = max(sm_count, cell_div(num_experts, kNumWarpGroups)); // !!!
+    // printf("dispatch sms: %d\n", num_sms);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
     const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     const int num_rdma_experts = num_experts / num_rdma_ranks;
+    assert(num_rdma_ranks <= kNumWarpGroups * kNumWarpsPerGroup);
     // Workspace checks
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_counter_per_rdma = atomic_counter_per_expert + num_experts;
@@ -513,7 +511,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
 
     const size_t num_bytes_per_msg_dispatch = sizeof(int4) + kTopk * 3 * sizeof(int) + (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     // const size_t num_int4_per_msg_dispatch = num_bytes_per_msg_dispatch / sizeof(int4);
-    const size_t num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch = sizeof(int4) + (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    // const size_t num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch = sizeof(int4) + (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     // const size_t num_int4_per_msg_rdma_revecier_and_nvl_sender_dispatch = num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch / sizeof(int4);
 
     const size_t dispatch_hidden_bytes = kHidden * (kDispatchUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
@@ -781,12 +779,16 @@ void combine(void* combined_x,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
              int phases, bool dispatch_use_fp8) {
-    constexpr int kNumWarpsPerGroup = 10;
-    constexpr int kNumWarpGroups = 3;
-    constexpr int kNumMaxTopk = 9;
+    constexpr int kNumWarpsPerGroup = 32;
+    constexpr int kNumWarpGroups = 1;
+    constexpr int kNumMaxTopk = 8;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-    const auto num_sms = cell_div(num_experts, kNumWarpGroups);
+    const int dev_id = 0;
+    int sm_count;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev_id);
+    const auto num_sms = max(sm_count, cell_div(num_experts, kNumWarpGroups));
+    // printf("combine num_sms: %d\n", num_sms);
     const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
     // Check workspace

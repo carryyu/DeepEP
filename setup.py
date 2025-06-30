@@ -14,7 +14,14 @@ if __name__ == '__main__':
         os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
-    nvcc_flags = ['-O3', '-Xcompiler', '-O3', '-rdc=true', '--ptxas-options=--register-usage-level=10']
+    nvcc_flags = [
+        '-O3', 
+        '-Xcompiler', 
+        '-rdc=true', 
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "--ptxas-options=--register-usage-level=10"]
     include_dirs = ['csrc/', f'{nvshmem_dir}/include']
     sources = ['csrc/deep_ep.cpp',
                'csrc/kernels/runtime.cu', 'csrc/kernels/intranode.cu',

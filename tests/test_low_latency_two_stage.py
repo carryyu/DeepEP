@@ -3,6 +3,8 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
+import time
+
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
@@ -30,11 +32,21 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     for i in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
+    # Calculate bandwidth
+    num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
+    num_dispatch_comm_bytes, num_combine_comm_bytes = 0, 0
+    for i in range(num_tokens):
+        num_selections = (topk_idx[i] != -1).sum().item()
+        num_dispatch_comm_bytes += num_fp8_bytes * num_selections
+        num_combine_comm_bytes += num_bf16_bytes * num_selections
+
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
+    warp_up_time = 20
+    all_times = 50
     for return_recv_hook in (False, ):
-        for dispatch_use_fp8 in (False, ):
+        for dispatch_use_fp8 in (True, ):
             num_times += 1
             # for i in range((num_times % 2) + 1):
             if (rank == 0):
@@ -46,54 +58,96 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 # print("num_tokens: ", num_tokens)
                 # print("num_experts: ", num_experts)
                 print("-------------------end-------------------")
-            torch.cuda.synchronize()
-            group.barrier()
-            packed_recv_x, packed_recv_count, rdma_send_flags, handle, event, hook = \
-                buffer.low_latency_dispatch_two_stage(
-                    x, 
-                    topk_idx, 
-                    topk_weights,
-                    num_tokens, 
-                    num_experts, 
-                    use_fp8=dispatch_use_fp8,
-                    async_finish=not return_recv_hook, 
-                    return_recv_hook=return_recv_hook)
+            for i in range(all_times):
+                if i == warp_up_time:
+                    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+                    cache.zero_()
+                    torch.cuda.synchronize()
+                    group.barrier()
+                    s_time = time.time()
+                packed_recv_x, packed_recv_count, rdma_send_flags, handle, event, hook = \
+                    buffer.low_latency_dispatch_two_stage(
+                        x, 
+                        topk_idx, 
+                        topk_weights,
+                        num_tokens, 
+                        num_experts, 
+                        use_fp8=dispatch_use_fp8,
+                        async_finish=not return_recv_hook, 
+                        return_recv_hook=return_recv_hook)
             # hook() if return_recv_hook else event.current_stream_wait()
             torch.cuda.synchronize()
             group.barrier()
-            if rank == 0:
-            # if True:
-                src_info, layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-                if dispatch_use_fp8:
-                    print("packed_recv_x: ", packed_recv_x[0])
-                    print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags}")
-                    for rank_i in range(num_local_experts):
-                        print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[0][rank_i][:(packed_recv_count[rank_i] + 1)]}, recv_scale: {packed_recv_x[1][rank_i][:(packed_recv_count[rank_i] + 1)]}")
-                        # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
-                else:
-                    print("packed_recv_x: ", packed_recv_x)
-                    for rank_i in range(num_local_experts):
-                        print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[rank_i][:(packed_recv_count[rank_i] + 1)]}")
-                        # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
-                print(f"rank: {rank}, layout_range: {layout_range.shape, layout_range}")
-                print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags.reshape([-1])}")
-                print(f"rank: {rank}, dispatch_rdma_recv_tensor: {dispatch_rdma_recv_tensor.shape, dispatch_rdma_recv_tensor[:, 8:-48]}")
-                print(f"rank: {rank}, dispatch_rdma_recv_count_tensor: {dispatch_rdma_recv_count_tensor.shape, dispatch_rdma_recv_count_tensor}")
-                print(f"rank: {rank}, num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}, hidden: {hidden}, num_experts: {num_experts}")
+            e_time = time.time()
+            dispatch_time = (e_time - s_time) / (all_times - warp_up_time)
+            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_time:.2f} GB/s, avg_t={dispatch_time * 1e6:.2f} us', flush=True)
+            packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
+            # if rank == 0:
+            # # if True:
+            #     src_info, layout_range, rdma_send_flags, packed_rdma_recv_count, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+            #     if dispatch_use_fp8:
+            #         # print("packed_recv_x: ", packed_recv_x[0])
+            #         print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags}")
+            #         for rank_i in range(num_local_experts):
+            #             print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[0][rank_i][:(packed_recv_count[rank_i] + 1)]}, recv_scale: {packed_recv_x[1][rank_i][:(packed_recv_count[rank_i] + 1)]}")
+            #             # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
+            #     else:
+            #         # print("packed_recv_x: ", packed_recv_x)
+            #         for rank_i in range(num_local_experts):
+            #             print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[rank_i][:(packed_recv_count[rank_i] + 1)]}")
+            #             # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
+            #     print(f"rank: {rank}, layout_range: {layout_range.shape, layout_range}")
+            #     print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags.reshape([-1])}")
+            #     print(f"rank: {rank}, dispatch_rdma_recv_tensor: {dispatch_rdma_recv_tensor.shape, dispatch_rdma_recv_tensor[:, 8:-48]}")
+            #     print(f"rank: {rank}, dispatch_rdma_recv_count_tensor: {dispatch_rdma_recv_count_tensor.shape, dispatch_rdma_recv_count_tensor}")
+            #     print(f"rank: {rank}, packed_rdma_recv_count: {packed_rdma_recv_count}")
+            #     print(f"rank: {rank}, num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}, hidden: {hidden}, num_experts: {num_experts}")
             
             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-            simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
-                if dispatch_use_fp8 else packed_recv_x.clone()
-            if rank == 0:
-                print('-------------------simulated_gemm_x-------------------')
-                print(f"rank: {rank}, simulated_gemm_x: {simulated_gemm_x.dtype, simulated_gemm_x.shape, simulated_gemm_x}", flush=True)
-                print('-------------------end-------------------')
-            combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
-                                                                    async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
-                                                                    return_recv_hook=return_recv_hook, out=out)
+            # simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
+            #     if dispatch_use_fp8 else packed_recv_x.clone()
+            if dispatch_use_fp8:
+                # print("packed_recv_x[0]: ", packed_recv_x[0].shape, packed_recv_x[0])
+                # print("packed_recv_x0 view: ", packed_recv_x[0].view(-1, hidden))
+                # print("packed_recv_x[1]: ", packed_recv_x[1].shape, packed_recv_x[1])
+                # print("packed_recv_x1 view: ", packed_recv_x[1].view(-1, hidden // 128))
+                simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
+            else:
+                simulated_gemm_x = packed_recv_x.clone()
+            # if rank == 0:
+            #     print('-------------------simulated_gemm_x-------------------')
+            #     print(f"rank: {rank}, simulated_gemm_x: {simulated_gemm_x.dtype, simulated_gemm_x.shape, simulated_gemm_x}", flush=True)
+            #     print('-------------------end-------------------')
+            for i in range(all_times):
+                if i == warp_up_time:
+                    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+                    cache.zero_()
+                    torch.cuda.synchronize()
+                    group.barrier()
+                    s_time = time.time()
+                # if (rank == 0):
+                #     print("packed_recv_x: ", packed_recv_x)
+                #     print("simulated_gemm_x: ", simulated_gemm_x)
+                #     print("topk_idx: ", topk_idx)
+                #     print("topk_weights: ", topk_weights)
+                #     print("handle: ", handle)
+                #     print("return_recv_hook: ", return_recv_hook)
+                #     print("async_finish: ", not return_recv_hook)
+                #     print("dispatch_use_fp8: ", dispatch_use_fp8)
+                combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                        async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
+                                                                        return_recv_hook=return_recv_hook, out=out)
+            torch.cuda.synchronize()
+            group.barrier()
+            e_time = time.time()
+            combine_time = (e_time - s_time) / (all_times - warp_up_time)
             if rank == 0:
                 print(f"rank: {rank}, combined_x: {combined_x.dtype, combined_x.shape, combined_x}", flush=True)
-                print(f"rank: {rank}, combined_x: {out.dtype, out.shape, out}", flush=True)
+            print(f'[rank {rank}] combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_time:.2f} GB/s, avg_t={combine_time * 1e6:.2f} us', flush=True)
+    
+    # avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
+    # print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+    #       f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
     return hash_value
 
 

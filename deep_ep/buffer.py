@@ -580,13 +580,13 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, event, hook = \
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_rdma_recv_count, packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, event, hook = \
             self.runtime.low_latency_dispatch_two_stage(x, topk_idx, topk_weights,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, async_finish, return_recv_hook)
-        handle = (packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+        handle = (packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, packed_rdma_recv_count, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx, topk_weights,
-                             packed_recv_x, packed_recv_x_scales, packed_recv_count,
+                             packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_rdma_recv_count,
                              packed_recv_src_info, packed_recv_layout_range, rdma_send_flags)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, rdma_send_flags, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
@@ -668,9 +668,9 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         # src_info, layout_range, rdma_send_flags, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        src_info, layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        src_info, layout_range, rdma_send_flags, packed_rdma_recv_count, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         combined_x, event, hook = self.runtime.low_latency_combine_two_stage(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   rdma_send_flags, num_max_dispatch_tokens_per_rank, num_experts,
+                                                                   rdma_send_flags, packed_rdma_recv_count, num_max_dispatch_tokens_per_rank, num_experts,
                                                                    dispatch_use_fp8, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook

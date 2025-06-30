@@ -1021,7 +1021,7 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
                                            at::cuda::getCurrentCUDAStream());
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch_two_stage(
     const torch::Tensor& x, 
     const torch::Tensor& topk_idx,
@@ -1049,8 +1049,10 @@ Buffer::low_latency_dispatch_two_stage(
     // Buffer control
     LowLatencyTwoStageLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, num_topk);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-    auto buffer = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    // auto buffer = layout.buffers[low_latency_buffer_idx];
+    // auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    auto buffer = layout.buffers[0];
+    auto next_buffer = layout.buffers[1];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -1068,6 +1070,7 @@ Buffer::low_latency_dispatch_two_stage(
     auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
     auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto packed_rdma_recv_count = torch::empty({num_ranks / NUM_MAX_NVL_PEERS}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     // Allocate column-majored scales
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
@@ -1089,6 +1092,7 @@ Buffer::low_latency_dispatch_two_stage(
             packed_recv_src_info.data_ptr<int>(), 
             packed_recv_layout_range.data_ptr<int64_t>(),
             packed_recv_count.data_ptr<int>(),
+            packed_rdma_recv_count.data_ptr<int>(),
             rdma_send_flags.data_ptr<bool>(),
             buffer.dispatch_rdma_recv_data_buffer, 
             buffer.dispatch_rdma_recv_count_buffer,
@@ -1115,21 +1119,21 @@ Buffer::low_latency_dispatch_two_stage(
         buffer.dispatch_rdma_recv_count_buffer, num_ranks / NUM_MAX_NVL_PEERS, torch::dtype(torch::kInt32).device(torch::kCUDA));
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
-        // so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
+    // if (async) {
+    //     // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
+    //     // so in Python API, we must wrap all tensors into the event handle.
+    //     event = EventHandle(launch_stream);
+    // } else if (not return_recv_hook) {
+    //     stream_wait(compute_stream, launch_stream);
+    // }
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    // if (return_recv_hook)
+    //     recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, event, recv_hook};
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_rdma_recv_count, packed_recv_src_info, packed_recv_layout_range, rdma_send_flags, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, event, recv_hook};
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
@@ -1219,7 +1223,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 
 std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-                                      const torch::Tensor& src_info, const torch::Tensor& layout_range, const torch::Tensor& rdma_send_flags,
+                                      const torch::Tensor& src_info, const torch::Tensor& layout_range, const torch::Tensor& rdma_send_flags, const torch::Tensor& dispatch_rdma_recv_count,
                                       int num_max_dispatch_tokens_per_rank, int num_experts,
                                       bool dispatch_use_fp8, bool async, bool return_recv_hook,
                                       const std::optional<torch::Tensor>& out) {
@@ -1248,9 +1252,12 @@ Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tenso
     // Buffer control
     LowLatencyTwoStageLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, num_topk);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
-    auto dispatch_buffer = layout.buffers[low_latency_buffer_idx ^ 1];
-    auto buffer = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    // auto dispatch_buffer = layout.buffers[low_latency_buffer_idx ^ 1];
+    // auto buffer = layout.buffers[low_latency_buffer_idx];
+    // auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
+    auto dispatch_buffer = layout.buffers[0];
+    auto buffer = layout.buffers[1];
+    auto next_buffer = layout.buffers[0];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -1278,7 +1285,7 @@ Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tenso
                                         buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                                         buffer.combine_rdma_send_buffer,
                                         dispatch_buffer.dispatch_rdma_recv_data_buffer, 
-                                        dispatch_buffer.dispatch_rdma_recv_count_buffer,
+                                        dispatch_rdma_recv_count.data_ptr<int>(),
                                         buffer_ptrs_gpu,
                                         x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
                                         src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),

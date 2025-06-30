@@ -20,6 +20,7 @@ __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 int* packed_recv_src_info, int64_t* packed_recv_layout_range,
                 int* packed_recv_count,
+                int* packed_rdma_recv_count,
                 bool* rdma_send_flags, // kNumRdmaRanks
                 void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
                 void** nvl_recv_x, // num_local_experts * dp_num * num_max_token_per_dp * hidden_size
@@ -296,6 +297,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens_per_rdma;
         if (thread_id == 0) {
             while ((num_recv_tokens_per_rdma = ld_acquire_sys_global(rdma_recv_count + src_rdma_rank)) == 0);
+            packed_rdma_recv_count[src_rdma_rank] = num_recv_tokens_per_rdma;
             num_recv_tokens_per_rdma = -num_recv_tokens_per_rdma - 1;
             // printf("src_rank: %d, src_rdma_rank: %d, send to rank: %d, num_recv_tokens_per_rdma: %d\n", 
             //         src_rank, src_rdma_rank, rank, num_recv_tokens_per_rdma);
@@ -425,6 +427,7 @@ void dispatch(void* packed_recv_x,
               int* packed_recv_src_info, 
               int64_t* packed_recv_layout_range,
               int* packed_recv_count,
+              int* packed_rdma_recv_count,
               bool* rdma_send_flags,
               void* rdma_recv_x, 
               int* rdma_recv_count, 
@@ -469,6 +472,7 @@ void dispatch(void* packed_recv_x,
                             packed_recv_x, packed_recv_x_scales,
                             packed_recv_src_info, packed_recv_layout_range,
                             packed_recv_count,
+                            packed_rdma_recv_count,
                             rdma_send_flags,
                             rdma_recv_x, rdma_recv_count, rdma_x,
                             nvl_recv_x, 
@@ -541,6 +545,18 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
     const size_t NVL_BUFFER_X_BYTES = kNumRdmaExperts * kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
 
+    // Clean up next buffer
+    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+        #pragma unroll
+        for (int i = lane_id; i < num_next_clean_int; i += 32)
+            next_clean[i] = 0;
+
+        // Notify before executing `int_p`
+        __syncwarp();
+        if (lane_id == 0)
+            atomic_add_release_global(atomic_clean_flag, num_experts);
+    }
+
     // nvl sender
     // 从不同的rank发到本地rank的token，原路返回，先发回本地源rank的rdma buffer中
     if (responsible_expert_idx < num_experts) {
@@ -564,7 +580,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
             const int idx_now = token_idx + offset;
             const int *src_idxs = local_src_info + idx_now;
             const int dst_rdma_index = src_idxs[0];
-            // not rdma_recv_x, nvl recv buffer
+            // nvl recv buffer
             const auto dst_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[dst_nvl_rank]) + 
                                 ((global_rdma_expert_idx * kNumRdmaRanks + dst_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_rdma_index) * num_bytes_per_slot);
             const auto x_int4 = local_x + idx_now * hidden_bf16_int4;
@@ -575,11 +591,11 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
         if (sub_warp_id == 1 and lane_id == 0) {
             // wait clean done
-            // while (ld_acquire_global(atomic_clean_flag) == 0);
+            while (ld_acquire_global(atomic_clean_flag) == 0);
             auto dst_ptr = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[dst_nvl_rank]) + NVL_BUFFER_X_BYTES) + global_rdma_expert_idx * kNumRdmaRanks + dst_rdma_rank;
             st_release_sys_global(dst_ptr, 1);
-            // // 重置atomic_clean_flag
-            // atomic_add_release_global(atomic_clean_flag, -1);
+            // 重置atomic_clean_flag
+            atomic_add_release_global(atomic_clean_flag, -1);
         }
         __syncwarp();
     }
@@ -623,8 +639,8 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     const int dst_cum_index = nvl_rank_meta[nvl_rank_idx * 3 + 1];
                     const float topk_weight = reinterpret_cast<const float*>(nvl_rank_meta)[nvl_rank_idx * 3 + 2];
                     // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
-                    //     printf("nvl_rank_nums: %d, nvl_rank_idx: %d, token_id: %d, dst_rdma_expert_idx: %d, dst_cum_index: %d, topk_weight: %f\n", 
-                    //             nvl_rank_nums, nvl_rank_idx, rdma_recv_token_idx, dst_rdma_expert_idx, dst_cum_index, topk_weight);   
+                    //     printf("nvl_rank_nums: %d, nvl_rank_idx: %d, token_id: %d, dst_rdma_expert_idx: %d, dst_cum_index: %d, topk_weight: %f, index_source: %d\n", 
+                    //             nvl_rank_nums, nvl_rank_idx, rdma_recv_token_idx, dst_rdma_expert_idx, dst_cum_index, topk_weight, index_source);   
                     // }
                     const int4 *src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + 
                                           ((dst_rdma_expert_idx * kNumRdmaRanks + deal_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_cum_index) * num_bytes_per_slot);
@@ -715,13 +731,6 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     }
     cg::this_grid().sync();
 
-    // Clean up next buffer
-    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
-        #pragma unroll
-        for (int i = lane_id; i < num_next_clean_int; i += 32)
-            next_clean[i] = 0;
-    }
-
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             float combined_values[kNumElemsPerInt4] = {0.0f};
@@ -754,21 +763,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
             #pragma unroll
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
                 combined_bf16[j] = static_cast<nv_bfloat16>(combined_values[j]);
-            // if (nvl_rank == 0 && sm_id == 0 && thread_id == 0) {
-            //     printf("token_idx: %d, combined_bf16:\n", token_idx);
-            //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
-            //         printf("combined_bf16[%d]: %f\n", 
-            //                 j, static_cast<float>(combined_bf16[j]));
-            //     }
-            // }
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
-            // if (nvl_rank == 0 && sm_id == 0 && thread_id == 0) {
-            //     printf("token_idx: %d, res:\n", token_idx);
-            //     for (int j = 0; j < kNumElemsPerInt4; ++ j) {
-            //         printf("res[%d]: %f\n", 
-            //                 j, static_cast<float>(reinterpret_cast<nv_bfloat16*>((reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + thread_id))[j]));
-            //     }
-            // }
         }
     }
 }

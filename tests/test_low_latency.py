@@ -32,6 +32,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
+    print_combine = True
     for return_recv_hook in (False, True):
         for dispatch_use_fp8 in (False, True):
             num_times += 1
@@ -81,6 +82,9 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                                      async_finish=not return_recv_hook, zero_copy=zero_copy,
                                                                      return_recv_hook=return_recv_hook, out=out)
                 hook() if return_recv_hook else event.current_stream_wait()
+                if print_combine and rank == 0:
+                    print_combine = False
+                    print(f"rank: {rank}, combined_x: {combined_x.dtype, combined_x.shape, combined_x}", flush=True)
                 if do_check:
                     diff = calc_diff(x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
                     assert torch.isnan(combined_x).sum().item() == 0
@@ -130,7 +134,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
     # Separate profiling
-    for return_recv_hook in (False, True):
+    for return_recv_hook in (False, ):
         group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
@@ -148,6 +152,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    print(f"rank: {rank}, num_ranks: {num_ranks}")
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 64
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)

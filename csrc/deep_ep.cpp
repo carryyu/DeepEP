@@ -1112,9 +1112,9 @@ Buffer::low_latency_dispatch_two_stage(
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     
-    size_t num_bytes_per_dispatch_msg = sizeof(int4) + num_topk * 3 * sizeof(int) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
+    size_t num_bytes_per_dispatch_msg = sizeof(int4) + num_ranks / NUM_MAX_NVL_PEERS * (num_topk * 3 + 1) * sizeof(int) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
     auto dispatch_rdma_recv_tensor = torch::from_blob(
-        buffer.dispatch_rdma_recv_data_buffer, {num_max_dispatch_tokens_per_rank, num_bytes_per_dispatch_msg / sizeof(int16_t)}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
+        buffer.dispatch_rdma_recv_data_buffer, {num_ranks / NUM_MAX_NVL_PEERS, num_max_dispatch_tokens_per_rank, num_bytes_per_dispatch_msg / sizeof(int16_t)}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
     auto dispatch_rdma_recv_count_tensor = torch::from_blob(
         buffer.dispatch_rdma_recv_count_buffer, num_ranks / NUM_MAX_NVL_PEERS, torch::dtype(torch::kInt32).device(torch::kCUDA));
     // Wait streams

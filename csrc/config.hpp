@@ -127,7 +127,9 @@ struct LowLatencyTwoStageLayout {
         // Message sizes
         // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
-        size_t num_bytes_per_dispatch_msg = sizeof(int4) + num_topk * 3 * sizeof(int) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
+        size_t num_bytes_per_dispatch_msg = sizeof(int4) + 
+                                            (num_rdma_ranks * (num_topk * 3 + 1) * sizeof(int) + sizeof(int4) - 1) / sizeof(int4) * sizeof(int4) + 
+                                            std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
         size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
 
         // Send buffer

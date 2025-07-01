@@ -71,7 +71,7 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
     return (scores * mask).view(num_tokens, num_experts)
 
 
-def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
+def bench(fn, num_warmups: int = 200, num_tests: int = 9800, post_fn=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
@@ -142,7 +142,7 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
-def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
+def bench_kineto(fn, kernel_names, num_tests: int = 10000, suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None, barrier_comm_profiling: bool = False):
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress

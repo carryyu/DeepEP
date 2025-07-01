@@ -185,14 +185,21 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                         UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                     } else {
-                        // 跨机，走RDMA，先按每次都send实现，不考虑组token，
-                        nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
-                                                          src_ptr, 
-                                                          num_bytes_per_msg, 
-                                                          dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                                                          dst_rdma_rank, // qp_id
-                                                          lane_id, // lane_id
-                                                          0); // message_idx
+                        // 跨机，走RDMA，先按每次都send实现，不考虑组batch，
+                        // nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
+                        //                                   src_ptr, 
+                        //                                   num_bytes_per_msg, 
+                        //                                   dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                        //                                   dst_rdma_rank, // qp_id
+                        //                                   lane_id, // lane_id
+                        //                                   0); // message_idx
+                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
+                                                    src_ptr, 
+                                                    num_bytes_per_msg, 
+                                                    dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                                                    dst_rdma_rank, // qp_id
+                                                    lane_id, // lane_id
+                                                    dst_cum_index); // message_idx
                     }
                     __syncwarp();
                     // 发送完成信息
@@ -294,10 +301,6 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     // 所有sms一起处理不同的token
     // 把收到的rdma buffer，根据标志位发送到不同专家上；
     // 注意：如果目标专家们在同一个卡上，会通过nvlink重复发送，原低时延实现同样如此，可能存在优化空间!!!
-    // if (sm_id > 0 && sm_id <= kNumRdmaRanks) {
-    //     const int sms_per_rdma = 1; // 多少个sms一起处理一个rdma ranks
-    //     const int src_rdma_rank = (sm_id - 1) / sms_per_rdma; // 处理收到的那个rdma rank的数据
-    //     const int sub_rdma_rank = (sm_id - 1) % sms_per_rdma;
     {
         const int sms_per_rdma = num_sms / kNumRdmaRanks; // 多少个sms一起处理一个rdma ranks
         const int src_rdma_rank = sm_id / sms_per_rdma; // 处理收到的那个rdma rank的数据
@@ -328,30 +331,54 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             const auto rdma_recv_nvl_rank_meta = reinterpret_cast<int*>(rdma_recv_x_scales + (kUseFP8 ? kNumScales : 0));
             const int dst_nvl_experts = *(rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1));
             const auto rdma_recv_nvl_rank_meta_now = rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1) + 1;
-            // 一个warp负责一个nvl expert的发送
-            // 当目标专家在同一个nvl rank时，发送多次
-            for (int loop_nvl_expert_i = warp_id; loop_nvl_expert_i < dst_nvl_experts; loop_nvl_expert_i += num_warps) {
+            const int num_warps_per_expert = num_warps / dst_nvl_experts; // min is num_warps / kTopk
+            const int num_threads_per_expert = num_warps_per_expert * 32;
+            const int loop_nvl_expert_i = thread_id / num_threads_per_expert;
+            if (loop_nvl_expert_i < dst_nvl_experts) {
                 const int rdma_local_expert_idx = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3];
                 const int rdma_local_expert_cumsum_index = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3 + 1];
                 const int dst_nvl_rank = rdma_local_expert_idx / kNumLocalExperts;
                 const int dst_nvl_local_expert = rdma_local_expert_idx % kNumLocalExperts;
-                // nvl_ranks * nvl_local_experts * dp_num * num_max_token_per_dp * hidden_size
                 const auto dst_data = 
                     reinterpret_cast<int4*>(nvl_recv_x[dst_nvl_rank]) + 
                     ((dst_nvl_local_expert * kNumRanks + src_rank) * num_max_dispatch_tokens_per_rank + rdma_local_expert_cumsum_index) * num_int4_per_msg_rdma_revecier_and_nvl_sender;
                 // 发送到目标nvl rank的local expert上，机内卡间传输
-                if (lane_id == 0) {
+                int start_vid = thread_id % num_threads_per_expert;
+                if (start_vid == 0) {
                     int *rdma_dst_cumsum_idx = reinterpret_cast<int*>(dst_data);
                     st_na_global(rdma_dst_cumsum_idx, rdma_local_expert_cumsum_index);
                 }
-                UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
-                // if (lane_id == 0 && src_rdma_rank == 0 && src_rank == 1 && dst_nvl_rank == 0 && dst_nvl_local_expert == 2) {
-                //     printf("rdma_recv_token_idx: %d, loop_nvl_expert_i: %d, src_rdma_rank: %d, src_rank: %d, nvl_rank: %d, dst_nvl_rank: %d, dst_nvl_local_expert: %d, dst_nvl_experts: %d, rdma_local_expert_cumsum_index: %d\n", 
-                //             rdma_recv_token_idx, loop_nvl_expert_i, src_rdma_rank, src_rank, nvl_rank, dst_nvl_rank, dst_nvl_local_expert, dst_nvl_experts, rdma_local_expert_cumsum_index);
-                // }
-                // 累加当前sm负责的src rank发到目标专家的token数量
-                lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
+                for (int vid = start_vid; vid < num_int4_per_msg_rdma_to_nvl; vid += num_threads_per_expert) {
+                    dst_data[vid + 1] = src_data[vid + 1];
+                }
+                start_vid == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
             }
+            // __syncthreads();
+
+            // // 一个warp负责一个nvl expert的发送
+            // // 当目标专家在同一个nvl rank时，发送多次
+            // for (int loop_nvl_expert_i = warp_id; loop_nvl_expert_i < dst_nvl_experts; loop_nvl_expert_i += num_warps) {
+            //     const int rdma_local_expert_idx = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3];
+            //     const int rdma_local_expert_cumsum_index = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3 + 1];
+            //     const int dst_nvl_rank = rdma_local_expert_idx / kNumLocalExperts;
+            //     const int dst_nvl_local_expert = rdma_local_expert_idx % kNumLocalExperts;
+            //     // nvl_ranks * nvl_local_experts * dp_num * num_max_token_per_dp * hidden_size
+            //     const auto dst_data = 
+            //         reinterpret_cast<int4*>(nvl_recv_x[dst_nvl_rank]) + 
+            //         ((dst_nvl_local_expert * kNumRanks + src_rank) * num_max_dispatch_tokens_per_rank + rdma_local_expert_cumsum_index) * num_int4_per_msg_rdma_revecier_and_nvl_sender;
+            //     // 发送到目标nvl rank的local expert上，机内卡间传输
+            //     if (lane_id == 0) {
+            //         int *rdma_dst_cumsum_idx = reinterpret_cast<int*>(dst_data);
+            //         st_na_global(rdma_dst_cumsum_idx, rdma_local_expert_cumsum_index);
+            //     }
+            //     UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
+            //     // if (lane_id == 0 && src_rdma_rank == 0 && src_rank == 1 && dst_nvl_rank == 0 && dst_nvl_local_expert == 2) {
+            //     //     printf("rdma_recv_token_idx: %d, loop_nvl_expert_i: %d, src_rdma_rank: %d, src_rank: %d, nvl_rank: %d, dst_nvl_rank: %d, dst_nvl_local_expert: %d, dst_nvl_experts: %d, rdma_local_expert_cumsum_index: %d\n", 
+            //     //             rdma_recv_token_idx, loop_nvl_expert_i, src_rdma_rank, src_rank, nvl_rank, dst_nvl_rank, dst_nvl_local_expert, dst_nvl_experts, rdma_local_expert_cumsum_index);
+            //     // }
+            //     // 累加当前sm负责的src rank发到目标专家的token数量
+            //     lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
+            // }
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + src_rdma_rank, 1)) : 0;
         // 确保所有sm处理完
@@ -716,13 +743,20 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                     UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, combine_hidden_int4_num, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 } else {
-                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
-                                                      src_ptr, 
-                                                      combine_hidden_bytes, 
-                                                      deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                                                      deal_rdma_rank, // qp_id
-                                                      lane_id, // lane_id
-                                                      0); // message_idx
+                    // nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
+                    //                                   src_ptr, 
+                    //                                   combine_hidden_bytes, 
+                    //                                   deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                    //                                   deal_rdma_rank, // qp_id
+                    //                                   lane_id, // lane_id
+                    //                                   0); // message_idx
+                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
+                                                src_ptr, 
+                                                combine_hidden_bytes, 
+                                                deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                                                deal_rdma_rank, // qp_id
+                                                lane_id, // lane_id
+                                                rdma_recv_token_idx); // message_idx
                 }
                 __syncwarp();
             }

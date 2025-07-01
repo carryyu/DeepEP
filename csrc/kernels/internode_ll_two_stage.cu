@@ -314,7 +314,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens_per_rdma;
         if (thread_id == 0) {
             while ((num_recv_tokens_per_rdma = ld_acquire_sys_global(rdma_recv_count + src_rdma_rank)) == 0);
-            packed_rdma_recv_count[src_rdma_rank] = num_recv_tokens_per_rdma;
+            sub_rdma_rank == 0 ? packed_rdma_recv_count[src_rdma_rank] = num_recv_tokens_per_rdma : 0;
             num_recv_tokens_per_rdma = -num_recv_tokens_per_rdma - 1;
             shared_num_recv_tokens[0] = num_recv_tokens_per_rdma;
         }

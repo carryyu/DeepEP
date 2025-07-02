@@ -15,7 +15,7 @@ __device__ void sleep(float t) {
         t1 = clock64();
 }
 
-template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumRdmaRanks, int kNumExperts, int kTopk>
+template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumRdmaRanks, int kNumExperts, int kTopk, int kNumQPs>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -25,7 +25,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
                 void** nvl_recv_x, // num_local_experts * dp_num * num_max_token_per_dp * hidden_size
                 const void* x, const int64_t* topk_idx, const float *topk_weights,
-                int* atomic_counter_per_expert, int* atomic_counter_per_rdma, int* atomic_finished_counter_per_rdma, int *atomic_recv_tokens_per_rdma_expert, int *atomic_nvl_sender_multi_sms,
+                int* atomic_counter_per_expert, int* atomic_counter_per_rdma, int* atomic_finished_counter_per_rdma, int *atomic_recv_tokens_per_rdma_expert, int *atomic_nvl_sender_multi_sms, int *atomic_counter_per_qp,
                 int* next_clean, int num_next_clean_int,
                 int num_tokens, int num_max_dispatch_tokens_per_rank,
                 int rank,
@@ -44,6 +44,11 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    const int qp_id = sm_id % kNumQPs;
+    // check
+    if (sm_id == 0 && thread_id == 0) {
+        EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= kNumQPs);
+    }
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -53,7 +58,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
 
     // 代表当前rand发送到每个rdma节点ran卡的token数量
-    __shared__ int shared_num_tokens_per_rdma[kNumRdmaRanks];
+    // __shared__ int shared_num_tokens_per_rdma[kNumRdmaRanks];
     
     // index_source, nvl_num, hidden, (scale), nvl_rank0, dst_idx0, ..., nvl_rank8, dst_idx8
     // int + int + hidden + hidden / 128 + moe_topk * 2 * int
@@ -75,9 +80,11 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     /* RDMA Sender */
     // 每个sm负责一个token，每个warp负责一个rdma rank
     // 所有sm参与共同搬运
-    if (warp_id < num_warps - 1) {
+    // if (warp_id < num_warps) {
+    {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
-        const auto num_threads_now = (num_warps - 1) * 32;
+        // const auto num_threads_now = (num_warps - 1) * 32;
+        const auto num_threads_now = (num_warps) * 32;
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         // 每个warp一次处理32 * 8个数，每128个数产生对应的scale
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
@@ -169,6 +176,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 if (dst_nvl_count > 0) {
                     lane_id == 0 ? (rdma_send_flags_now[dst_rdma_rank] = true) : 0;
                     int dst_cum_index = lane_id == 0 ? atomicAdd(&atomic_counter_per_rdma[dst_rdma_rank], 1) : 0;
+                    // int dst_qp_cum_index = lane_id == 0 ? atomicAdd(&atomic_counter_per_qp[dst_rdma_rank * kNumQPs + qp_id], 1) : 0;
                     // if (lane_id == 0 && rdma_rank == 0 && nvl_rank == 1 && dst_rdma_rank == 0 && (token_idx == 4 || token_idx == 16 || token_idx == 30 || token_idx == 31 || token_idx == 53 || token_idx == 55 || token_idx == 64 || token_idx == 79 || token_idx == 80 || token_idx == 82 || token_idx == 89 || token_idx == 111)) {
                     //     printf("token_idx: %d, rdma_rank: %d, nvl_rank: %d, dst_rdma_rank: %d, rdma_recv dst_nvl_count: %d, dst_cum_index: %d\n",
                     //             token_idx, rdma_rank, nvl_rank, dst_rdma_rank, dst_nvl_count, dst_cum_index);
@@ -180,26 +188,27 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                                      rdma_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      dst_cum_index * num_bytes_per_msg;
                     if (rdma_rank == dst_rdma_rank) {
-                        // 在当前卡上，直接拷贝
+                        // 在当前卡上，直接拷贝，TODO用TMA
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                         UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                     } else {
                         // 跨机，走RDMA，先按每次都send实现，不考虑组batch，
-                        // nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
-                        //                                   src_ptr, 
-                        //                                   num_bytes_per_msg, 
-                        //                                   dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                        //                                   dst_rdma_rank, // qp_id
-                        //                                   lane_id, // lane_id
-                        //                                   0); // message_idx
-                        nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
-                                                    src_ptr, 
-                                                    num_bytes_per_msg, 
-                                                    dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                                                    dst_rdma_rank, // qp_id
-                                                    lane_id, // lane_id
-                                                    dst_cum_index); // message_idx
+                        nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
+                                                          src_ptr, 
+                                                          num_bytes_per_msg, 
+                                                          dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                                                          qp_id, // qp_id
+                                                          lane_id, // lane_id
+                                                          0); // message_idx
+                        // nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
+                        //                             src_ptr, 
+                        //                             num_bytes_per_msg, 
+                        //                             dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                        //                             qp_id, // qp_id
+                        //                             // 0,
+                        //                             lane_id, // lane_id
+                        //                             dst_qp_cum_index); // message_idx
                     }
                     __syncwarp();
                     // 发送完成信息
@@ -207,94 +216,88 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 }
             }
         }
-    } else if (warp_id == num_warps - 1) {
-        EP_DEVICE_ASSERT(num_sms > 1);
-        if (sm_id == 0) {
-            EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= kNumRdmaRanks); // 是否需要时 kNumRanks
-            // #pragma unroll
-            // for (int i = lane_id; i < num_next_clean_int; i += 32)
-            //     next_clean[i] = 0;
-            // __syncwarp();
-            // 确保clean完成
-            #pragma unroll
-            for (int i = lane_id; i < kNumRdmaRanks; i += 32)
-                atomic_add_release_global(atomic_finished_counter_per_rdma + i, FINISHED_SUM_TAG);
-        } else if (sm_id <= kNumRdmaRanks) {
-            // 统计发到对应rdma_rank上的token数量
-            int dst_rdma_rank = sm_id - 1;
-            int rdma_token_num = 0;
-            const int dst_rdma_expert_start = dst_rdma_rank * kNumRdmaExperts;
-            const int dst_rdma_expert_end = (dst_rdma_rank + 1) * kNumRdmaExperts;
-            // Per lane count
-            for (int i = lane_id; i < num_tokens; i += 32) {
-                const auto topk_idx_now = topk_idx + i * kTopk;
-                for (int j = 0; j < kTopk; ++j) {
-                    auto idx = static_cast<int>(__ldg(topk_idx_now + j));
-                    if (idx >= dst_rdma_expert_start && idx < dst_rdma_expert_end) {
-                        rdma_token_num += 1;
-                        break;
-                    }
-                }
-            }
-            auto sum = warp_reduce_sum(rdma_token_num);
-            if (lane_id == 0) {
-                // printf("sm_id: %d, num_sms: %d\n", sm_id, num_sms);
-                // printf("src_rank: %d, dst_rdma_rank: %d, rdma_token_num: %d, atomic_finished_counter_per_rdma: %d\n", rank, dst_rdma_rank, sum, ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank));
-                // printf("dst_rdma_expert_start: %d, dst_rdma_expert_end: %d\n", dst_rdma_expert_start, dst_rdma_expert_end);
+    }
+    // if (sm_id > 0 && sm_id <= kNumRdmaRanks && warp_id == num_warps - 1) {
+    //     // 统计发到对应rdma_rank上的token数量
+    //     int dst_rdma_rank = sm_id - 1;
+    //     int rdma_token_num = 0;
+    //     const int dst_rdma_expert_start = dst_rdma_rank * kNumRdmaExperts;
+    //     const int dst_rdma_expert_end = (dst_rdma_rank + 1) * kNumRdmaExperts;
+    //     // Per lane count
+    //     for (int i = lane_id; i < num_tokens; i += 32) {
+    //         const auto topk_idx_now = topk_idx + i * kTopk;
+    //         for (int j = 0; j < kTopk; ++j) {
+    //             auto idx = static_cast<int>(__ldg(topk_idx_now + j));
+    //             if (idx >= dst_rdma_expert_start && idx < dst_rdma_expert_end) {
+    //                 rdma_token_num += 1;
+    //                 break;
+    //             }
+    //         }
+    //     }
+    //     auto sum = warp_reduce_sum(rdma_token_num);
+    //     if (lane_id == 0) {
+    //         // printf("sm_id: %d, num_sms: %d\n", sm_id, num_sms);
+    //         // printf("src_rank: %d, dst_rdma_rank: %d, rdma_token_num: %d, atomic_finished_counter_per_rdma: %d\n", rank, dst_rdma_rank, sum, ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank));
+    //         // printf("dst_rdma_expert_start: %d, dst_rdma_expert_end: %d\n", dst_rdma_expert_start, dst_rdma_expert_end);
 
-                shared_num_tokens_per_rdma[dst_rdma_rank] = sum;
-                atomic_add_release_global(atomic_finished_counter_per_rdma + dst_rdma_rank, FINISHED_SUM_TAG - sum);
-            }
+    //         shared_num_tokens_per_rdma[dst_rdma_rank] = sum;
+    //         // atomic_add_release_global(atomic_finished_counter_per_rdma + dst_rdma_rank, FINISHED_SUM_TAG - sum);
+    //     }
+    // }
+    // __syncthreads();
+    if (sm_id == num_sms - 1) {
+        for (int i = thread_id; i < kNumLocalExperts; i += num_threads) {
+            packed_recv_count[i] = 0;
         }
     }
-    __syncthreads();
+    cg::this_grid().sync();
     
 
     // Issue count sends
     // 告知对端rdma rank，当前rank的数据发送完了
     // kNumRdmaRanks个sm负责发送完成标志
-    if (sm_id > 0 && sm_id <= kNumRdmaRanks) {
-        int dst_rdma_rank = sm_id - 1;
-        const auto num_tokens_sent = shared_num_tokens_per_rdma[dst_rdma_rank];
+    if (sm_id < kNumRdmaRanks) {
+        int dst_rdma_rank = sm_id;
+        // const auto num_tokens_sent = shared_num_tokens_per_rdma[dst_rdma_rank];
+        const auto num_tokens_sent = atomic_finished_counter_per_rdma[dst_rdma_rank];
         
-        if (thread_id == 0) {
+        if (thread_id < kNumQPs) {
             // 确保init和发送处理完成
-            while (ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank) != FINISHED_SUM_TAG * 2);
-            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + rdma_rank); // 发到其他机器的rdma rank位置上，代表从rdma rank收到多少token
+            // while (ld_acquire_global(atomic_finished_counter_per_rdma + dst_rdma_rank) != num_tokens_sent);
+            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + rdma_rank * kNumQPs + thread_id); // 发到其他机器的rdma rank位置上，代表从rdma rank收到多少token
 
             bool is_local_copy = dst_rdma_rank == rdma_rank;
             // printf("nvl_rank: %d, dst_rdma_rank: %d, rdma_rank: %d, is_local_copy: %d, copy_num: %d\n",
             //         nvl_rank, dst_rdma_rank, rdma_rank, (int)is_local_copy, num_tokens_sent);
             if (is_local_copy) { // local copy
                 // atomicAdd(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
-                st_na_release(rdma_recv_count + rdma_rank, -num_tokens_sent - 1);
+                st_na_release(rdma_recv_count + rdma_rank * kNumQPs + thread_id, -num_tokens_sent - 1);
             } else {
                 nvshmemi_ibgda_amo_nonfetch_add(
                     reinterpret_cast<int*>(dst_ptr), // rptr
                     -num_tokens_sent - 1, // value
                     dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
-                    dst_rdma_rank); // qp_id
+                    thread_id
+                    // 0
+                    ); // qp_id
             }
-            // clean
-            atomic_counter_per_rdma[dst_rdma_rank] = 0;
-            atomic_finished_counter_per_rdma[dst_rdma_rank] = 0;  
         }
         __syncthreads();
-        // init packed_recv_count
-        if (sm_id == kNumRdmaRanks) {
-            for (int i = thread_id; i < kNumLocalExperts; i += num_threads) {
-                packed_recv_count[i] = 0;
-            }
-        }
+        // clean
+        if (thread_id == 0) {
+            atomic_counter_per_rdma[dst_rdma_rank] = 0;
+            atomic_finished_counter_per_rdma[dst_rdma_rank] = 0; 
+        } 
     }
 
     // making `packed_recv_count` visible
-    cg::this_grid().sync();
+    // cg::this_grid().sync();
     if (sm_id == num_sms - 1) {
         for (int i = thread_id; i < kNumExperts; i += num_threads) {
             atomic_counter_per_expert[i] = 0;
         }
     }
+    // sleep(10);
 
     /* RDMA Receiver and NVL Sender */
     // 轮询rdma_recv_count，确保当前rank从src rdma rank接收token完成
@@ -312,11 +315,19 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
 
         __shared__ int shared_num_recv_tokens[1];
         int num_recv_tokens_per_rdma;
-        if (thread_id == 0) {
-            while ((num_recv_tokens_per_rdma = ld_acquire_sys_global(rdma_recv_count + src_rdma_rank)) == 0);
-            sub_rdma_rank == 0 ? packed_rdma_recv_count[src_rdma_rank] = num_recv_tokens_per_rdma : 0;
-            num_recv_tokens_per_rdma = -num_recv_tokens_per_rdma - 1;
-            shared_num_recv_tokens[0] = num_recv_tokens_per_rdma;
+        if (thread_id < kNumQPs) {
+            while ((num_recv_tokens_per_rdma = ld_acquire_sys_global(rdma_recv_count + src_rdma_rank * kNumQPs + thread_id)) == 0) {
+                // sleep(1);
+                // printf("wait sm_id: %d, src_rdma_rank: %d, qp_id: %d, num_recv_tokens_per_rdma: %d\n",
+                //         sm_id, src_rdma_rank, thread_id, num_recv_tokens_per_rdma);
+            }
+            // printf("success sm_id: %d, src_rdma_rank: %d, qp_id: %d, num_recv_tokens_per_rdma: %d\n",
+            //         sm_id, src_rdma_rank, thread_id, num_recv_tokens_per_rdma);
+            if (thread_id == 0) {
+                sub_rdma_rank == 0 ? packed_rdma_recv_count[src_rdma_rank] = num_recv_tokens_per_rdma : 0;
+                num_recv_tokens_per_rdma = -num_recv_tokens_per_rdma - 1;
+                shared_num_recv_tokens[0] = num_recv_tokens_per_rdma;
+            }
         }
         __syncthreads();
         num_recv_tokens_per_rdma = shared_num_recv_tokens[0];
@@ -331,59 +342,37 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             const auto rdma_recv_nvl_rank_meta = reinterpret_cast<int*>(rdma_recv_x_scales + (kUseFP8 ? kNumScales : 0));
             const int dst_nvl_experts = *(rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1));
             const auto rdma_recv_nvl_rank_meta_now = rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1) + 1;
-            const int num_warps_per_expert = num_warps / dst_nvl_experts; // min is num_warps / kTopk
-            const int num_threads_per_expert = num_warps_per_expert * 32;
-            const int loop_nvl_expert_i = thread_id / num_threads_per_expert;
-            if (loop_nvl_expert_i < dst_nvl_experts) {
+
+            // 一个warp负责一个nvl expert的发送
+            // 当目标专家在同一个nvl rank时，发送多次
+            for (int loop_nvl_expert_i = warp_id; loop_nvl_expert_i < dst_nvl_experts; loop_nvl_expert_i += num_warps) {
                 const int rdma_local_expert_idx = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3];
                 const int rdma_local_expert_cumsum_index = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3 + 1];
                 const int dst_nvl_rank = rdma_local_expert_idx / kNumLocalExperts;
                 const int dst_nvl_local_expert = rdma_local_expert_idx % kNumLocalExperts;
+                // nvl_ranks * nvl_local_experts * dp_num * num_max_token_per_dp * hidden_size
                 const auto dst_data = 
                     reinterpret_cast<int4*>(nvl_recv_x[dst_nvl_rank]) + 
                     ((dst_nvl_local_expert * kNumRanks + src_rank) * num_max_dispatch_tokens_per_rank + rdma_local_expert_cumsum_index) * num_int4_per_msg_rdma_revecier_and_nvl_sender;
                 // 发送到目标nvl rank的local expert上，机内卡间传输
-                int start_vid = thread_id % num_threads_per_expert;
-                if (start_vid == 0) {
+                if (lane_id == 0) {
                     int *rdma_dst_cumsum_idx = reinterpret_cast<int*>(dst_data);
                     st_na_global(rdma_dst_cumsum_idx, rdma_local_expert_cumsum_index);
                 }
-                for (int vid = start_vid; vid < num_int4_per_msg_rdma_to_nvl; vid += num_threads_per_expert) {
-                    dst_data[vid + 1] = src_data[vid + 1];
-                }
-                start_vid == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
+                UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
+                // if (lane_id == 0 && src_rdma_rank == 0 && src_rank == 1 && dst_nvl_rank == 0 && dst_nvl_local_expert == 2) {
+                //     printf("rdma_recv_token_idx: %d, loop_nvl_expert_i: %d, src_rdma_rank: %d, src_rank: %d, nvl_rank: %d, dst_nvl_rank: %d, dst_nvl_local_expert: %d, dst_nvl_experts: %d, rdma_local_expert_cumsum_index: %d\n", 
+                //             rdma_recv_token_idx, loop_nvl_expert_i, src_rdma_rank, src_rank, nvl_rank, dst_nvl_rank, dst_nvl_local_expert, dst_nvl_experts, rdma_local_expert_cumsum_index);
+                // }
+                // 累加当前sm负责的src rank发到目标专家的token数量
+                lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
             }
-            // __syncthreads();
-
-            // // 一个warp负责一个nvl expert的发送
-            // // 当目标专家在同一个nvl rank时，发送多次
-            // for (int loop_nvl_expert_i = warp_id; loop_nvl_expert_i < dst_nvl_experts; loop_nvl_expert_i += num_warps) {
-            //     const int rdma_local_expert_idx = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3];
-            //     const int rdma_local_expert_cumsum_index = rdma_recv_nvl_rank_meta_now[loop_nvl_expert_i * 3 + 1];
-            //     const int dst_nvl_rank = rdma_local_expert_idx / kNumLocalExperts;
-            //     const int dst_nvl_local_expert = rdma_local_expert_idx % kNumLocalExperts;
-            //     // nvl_ranks * nvl_local_experts * dp_num * num_max_token_per_dp * hidden_size
-            //     const auto dst_data = 
-            //         reinterpret_cast<int4*>(nvl_recv_x[dst_nvl_rank]) + 
-            //         ((dst_nvl_local_expert * kNumRanks + src_rank) * num_max_dispatch_tokens_per_rank + rdma_local_expert_cumsum_index) * num_int4_per_msg_rdma_revecier_and_nvl_sender;
-            //     // 发送到目标nvl rank的local expert上，机内卡间传输
-            //     if (lane_id == 0) {
-            //         int *rdma_dst_cumsum_idx = reinterpret_cast<int*>(dst_data);
-            //         st_na_global(rdma_dst_cumsum_idx, rdma_local_expert_cumsum_index);
-            //     }
-            //     UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
-            //     // if (lane_id == 0 && src_rdma_rank == 0 && src_rank == 1 && dst_nvl_rank == 0 && dst_nvl_local_expert == 2) {
-            //     //     printf("rdma_recv_token_idx: %d, loop_nvl_expert_i: %d, src_rdma_rank: %d, src_rank: %d, nvl_rank: %d, dst_nvl_rank: %d, dst_nvl_local_expert: %d, dst_nvl_experts: %d, rdma_local_expert_cumsum_index: %d\n", 
-            //     //             rdma_recv_token_idx, loop_nvl_expert_i, src_rdma_rank, src_rank, nvl_rank, dst_nvl_rank, dst_nvl_local_expert, dst_nvl_experts, rdma_local_expert_cumsum_index);
-            //     // }
-            //     // 累加当前sm负责的src rank发到目标专家的token数量
-            //     lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
-            // }
         }
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + src_rdma_rank, 1)) : 0;
         // 确保所有sm处理完
         if (sub_rdma_rank == 0 && thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + src_rdma_rank) != sms_per_rdma);
+            atomic_nvl_sender_multi_sms[src_rdma_rank] = 0;
         }
         __syncthreads();
         // 设置对端标志位
@@ -397,9 +386,10 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 // reset
                 *(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + dst_rdma_local_expert_idx) = 0;
             }
-            // reset
-            thread_id == 0 ? atomic_nvl_sender_multi_sms[src_rdma_rank] = 0 : 0;
-            thread_id == 0 ? rdma_recv_count[src_rdma_rank] = 0 : 0;
+            // thread_id == 0 ? rdma_recv_count[src_rdma_rank] = 0 : 0;
+            for (int reset_i = thread_id; reset_i < kNumQPs; reset_i += num_threads) {
+                rdma_recv_count[src_rdma_rank * kNumQPs + reset_i] = 0;
+            }
         }
     }
     
@@ -455,6 +445,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             //             rdma_rank, nvl_rank, local_expert_idx, src_rank);
             // }
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
+            // TODO: USE TMA
             UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
@@ -496,6 +487,7 @@ void dispatch(void* packed_recv_x,
     constexpr int kNumMaxTopK = 8;
     constexpr int kNumWarpsPerGroup = 32;
     constexpr int kNumWarpGroups = 1;
+    constexpr int kNumQPs = 32;
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
@@ -514,14 +506,15 @@ void dispatch(void* packed_recv_x,
     auto atomic_finished_counter_per_rdma = atomic_counter_per_rdma + num_rdma_ranks;
     auto atomic_recv_tokens_per_rdma_expert = atomic_finished_counter_per_rdma + num_rdma_ranks;
     auto atomic_nvl_sender_multi_sms = atomic_recv_tokens_per_rdma_expert + num_rdma_ranks * num_rdma_experts; // num_rdma_ranks
-    EP_HOST_ASSERT((num_experts + num_rdma_ranks * 3 + num_rdma_experts) * sizeof(int) <= NUM_WORKSPACE_BYTES);
+    auto atomic_counter_per_qp = atomic_nvl_sender_multi_sms + num_rdma_ranks; // num_rdma_ranks * kNumQPs
+    EP_HOST_ASSERT((num_experts + num_rdma_ranks * 3 + num_rdma_experts + num_rdma_ranks * kNumQPs) * sizeof(int) <= NUM_WORKSPACE_BYTES);
 
     DISPATCH_HIDDEN_SIZE(hidden, kHidden, {
         DISPATCH_NUM_TOPK(num_topk, kTopk, {
             DISPATCH_RDMA_RANKS(num_rdma_ranks, kNumRdmaRanks, {
                DISPATCH_NUM_EXPERTS(num_experts, kNumExperts, {
-                auto dispatch_func = use_fp8 ? dispatch_kernel<true, kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk> :
-                                               dispatch_kernel<false, kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk>;
+                auto dispatch_func = use_fp8 ? dispatch_kernel<true, kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, kNumQPs> :
+                                               dispatch_kernel<false, kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, kNumQPs>;
                 SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
                 LAUNCH_KERNEL(&cfg, dispatch_func,
                             packed_recv_x, packed_recv_x_scales,
@@ -533,14 +526,14 @@ void dispatch(void* packed_recv_x,
                             nvl_recv_x, 
                             // nvl_recv_count,
                             x, topk_idx, topk_weights,
-                            atomic_counter_per_expert, atomic_counter_per_rdma, atomic_finished_counter_per_rdma, atomic_recv_tokens_per_rdma_expert, atomic_nvl_sender_multi_sms,
+                            atomic_counter_per_expert, atomic_counter_per_rdma, atomic_finished_counter_per_rdma, atomic_recv_tokens_per_rdma_expert, atomic_nvl_sender_multi_sms, atomic_counter_per_qp,
                             next_clean, num_next_clean_int,
                             num_tokens, num_max_dispatch_tokens_per_rank,
                             rank, phases);
      })})})});
 }
 
-template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumRdmaRanks, int kNumExperts, int kTopk, bool kDispatchUseFP8>
+template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumRdmaRanks, int kNumExperts, int kTopk, bool kDispatchUseFP8, int kNumQPs>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                void* rdma_recv_x, //  num_rdma_ranks * num_max_tokens * hidden
@@ -586,6 +579,10 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
+
+    if (sm_id == 0 && thread_id == 0) {
+        EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= kNumQPs);
+    }
 
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     // if (rdma_rank == 0 && nvl_rank == 0 && thread_id == 0 && sm_id == 0) {
@@ -673,6 +670,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         const int sms_per_rdma = num_sms / kNumRdmaRanks; // 多少个sms一起处理一个rdma ranks
         const int deal_rdma_rank = sm_id / sms_per_rdma; // 代表从哪个rdma rank收到的
         const int sub_deal_rdma_rank = sm_id % sms_per_rdma;
+        const int qp_id = sub_deal_rdma_rank % kNumQPs;
         const int num_tokens_to_deal = (-dispatch_rdma_recv_count[deal_rdma_rank] - 1);
         // if (thread_id == 0 && nvl_rank == 0 && rdma_rank == 0 && sub_deal_rdma_rank == 0) {
         //     printf("num_tokens_to_deal: %d\n", num_tokens_to_deal);
@@ -738,25 +736,25 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                                     (rdma_rank * num_max_dispatch_tokens_per_rank + index_source) * combine_hidden_bytes;
                 if (rdma_rank == deal_rdma_rank) {
-                    // local copy
+                    // local copy, TODO: use tma
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                     UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, combine_hidden_int4_num, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 } else {
-                    // nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
-                    //                                   src_ptr, 
-                    //                                   combine_hidden_bytes, 
-                    //                                   deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                    //                                   deal_rdma_rank, // qp_id
-                    //                                   lane_id, // lane_id
-                    //                                   0); // message_idx
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
-                                                src_ptr, 
-                                                combine_hidden_bytes, 
-                                                deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
-                                                deal_rdma_rank, // qp_id
-                                                lane_id, // lane_id
-                                                rdma_recv_token_idx); // message_idx
+                    nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr, 
+                                                      src_ptr, 
+                                                      combine_hidden_bytes, 
+                                                      deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                                                      qp_id, // qp_id
+                                                      lane_id, // lane_id
+                                                      0); // message_idx
+                    // nvshmemi_ibgda_put_nbi_warp(dst_ptr, 
+                    //                             src_ptr, 
+                    //                             combine_hidden_bytes, 
+                    //                             deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank, // dst_pe
+                    //                             deal_rdma_rank, // qp_id
+                    //                             lane_id, // lane_id
+                    //                             rdma_recv_token_idx); // message_idx
                 }
                 __syncwarp();
             }
@@ -765,17 +763,18 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         // all sms reduce done
         if (sub_deal_rdma_rank == 0 && thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != sms_per_rdma);
+            atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0
         }
         __syncthreads();
         // set flag
-        if (sub_deal_rdma_rank == 0 && thread_id == 0) {
+        if (sub_deal_rdma_rank == 0 && thread_id < kNumQPs) {
             // notify remote rdma
-            auto dst_rdma_flag = reinterpret_cast<uint64_t>(rdma_recv_flag + rdma_rank);
+            auto dst_rdma_flag = reinterpret_cast<uint64_t>(rdma_recv_flag + rdma_rank * kNumQPs + thread_id);
             bool is_local_copy = deal_rdma_rank == rdma_rank;
             if (is_local_copy) { // local copy
                 // printf("rank: %d, rdma_recv_flag old: %d\n", nvl_rank, rdma_recv_flag[rdma_rank]);
                 // int old = atomicAdd(rdma_recv_flag + rdma_rank, 1);
-                st_na_release(rdma_recv_flag + rdma_rank, 1);
+                st_na_release(rdma_recv_flag + rdma_rank * kNumQPs + thread_id, 1);
                 // printf("old: %d\n", old);
                 // printf("rank: %d, rdma_recv_flag new: %d\n", nvl_rank, rdma_recv_flag[rdma_rank]);
             } else {
@@ -783,18 +782,17 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     reinterpret_cast<int*>(dst_rdma_flag), // rptr
                     1, // value
                     deal_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank,  // dst_pe
-                    deal_rdma_rank); // qp_id
+                    qp_id); // qp_id
             }
-            atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0;
         }
     }
     // rdma revecier and reducer
     // Wait all rdma ranks to arrive
     if (sm_id < kNumRdmaRanks) {
-        if (warp_id == 0 and lane_id == 0) {
-            while (ld_acquire_sys_global(rdma_recv_flag + sm_id) == 0);
+        if (thread_id < kNumQPs) {
+            while (ld_acquire_sys_global(rdma_recv_flag + sm_id * kNumQPs + thread_id) == 0);
             // reset
-            rdma_recv_flag[sm_id] = 0;
+            rdma_recv_flag[sm_id * kNumQPs + thread_id] = 0;
         }
     }
     cg::this_grid().sync();
@@ -852,6 +850,7 @@ void combine(void* combined_x,
     constexpr int kNumWarpsPerGroup = 32;
     constexpr int kNumWarpGroups = 1;
     constexpr int kNumMaxTopk = 8;
+    constexpr int kNumQPs = 4;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const int dev_id = 0;
@@ -871,8 +870,8 @@ void combine(void* combined_x,
         DISPATCH_NUM_TOPK(num_topk, kTopk, {
             DISPATCH_RDMA_RANKS(num_rdma_ranks, kNumRdmaRanks, {
                 DISPATCH_NUM_EXPERTS(num_experts, kNumExperts, {
-                    auto combine_func = dispatch_use_fp8 ? combine_kernel<kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, true> :
-                                                            combine_kernel<kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, false>;
+                    auto combine_func = dispatch_use_fp8 ? combine_kernel<kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, true, kNumQPs> :
+                                                            combine_kernel<kNumWarpGroups, kNumWarpsPerGroup, kHidden, kNumRdmaRanks, kNumExperts, kTopk, false, kNumQPs>;
                     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
                     LAUNCH_KERNEL(
                         &cfg, combine_func,

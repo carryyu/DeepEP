@@ -148,7 +148,8 @@ struct LowLatencyTwoStageLayout {
         total_bytes += recv_buffer_bytes * 2;
 
         // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_rdma_ranks * sizeof(int);
+        constexpr int kMaxNumQPs = 64;
+        size_t dispatch_recv_count_buffer_bytes = num_rdma_ranks * kMaxNumQPs * sizeof(int); // kMaxNumQPs = 64
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
         total_bytes += signaling_buffer_bytes * 2;

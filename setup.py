@@ -17,6 +17,7 @@ if __name__ == '__main__':
     nvcc_flags = [
         '-O3', 
         '-Xcompiler', 
+        '-O3', 
         '-rdc=true', 
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",

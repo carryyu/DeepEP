@@ -52,7 +52,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
         task_fifo_ptrs_gpu = reinterpret_cast<int**>(reinterpret_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + fifo_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
-        CUDA_CHECK(cudaMemsetAsync(task_fifo_ptrs[nvl_rank], 0, fifo_bytes, comm_stream));
+        CUDA_CHECK(cudaMemsetAsync(buffer_ptrs[nvl_rank], 0, num_nvl_bytes + fifo_bytes + buffer_ptr_bytes + task_ptr_bytes, comm_stream));
+        // CUDA_CHECK(cudaMemsetAsync(task_fifo_ptrs[nvl_rank], 0, fifo_bytes, comm_stream));
     }
 
     // Create 32 MiB workspace
@@ -1057,10 +1058,11 @@ Buffer::low_latency_dispatch_two_stage(
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not (async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // EP_HOST_ASSERT(not (async and return_recv_hook));
+    // if (not return_recv_hook)
+    //     stream_wait(launch_stream, compute_stream);
+    auto launch_stream = compute_stream;
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
@@ -1110,7 +1112,8 @@ Buffer::low_latency_dispatch_two_stage(
             phases
             );
     };
-    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    // launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    launcher((LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
     
     size_t num_bytes_per_dispatch_msg = sizeof(int4) + num_ranks / NUM_MAX_NVL_PEERS * (num_topk * 3 + 1) * sizeof(int) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
     auto dispatch_rdma_recv_tensor = torch::from_blob(
@@ -1262,10 +1265,11 @@ Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tenso
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not (async and return_recv_hook));
-    if (not return_recv_hook)
-        stream_wait(launch_stream, compute_stream);
+    // auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // EP_HOST_ASSERT(not (async and return_recv_hook));
+    // if (not return_recv_hook)
+    //     stream_wait(launch_stream, compute_stream);
+    auto launch_stream = compute_stream;
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -1296,22 +1300,23 @@ Buffer::low_latency_combine_two_stage(const torch::Tensor& x, const torch::Tenso
                                         workspace, launch_stream,
                                         phases, dispatch_use_fp8);
     };
-    launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    // launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    launcher((LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
     // Wait streams
     std::optional<EventHandle> event;
-    if (async) {
-        // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
-        // so in Python API, we must wrap all tensors into the event handle.
-        event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
-    }
+    // if (async) {
+    //     // NOTES: we must ensure the all tensors will not be deallocated before the stream-wait happens,
+    //     // so in Python API, we must wrap all tensors into the event handle.
+    //     event = EventHandle(launch_stream);
+    // } else if (not return_recv_hook) {
+    //     stream_wait(compute_stream, launch_stream);
+    // }
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    // if (return_recv_hook)
+    //     recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
     return {combined_x, event, recv_hook};

@@ -15,6 +15,11 @@ __device__ void sleep(float t) {
         t1 = clock64();
 }
 
+// template<typename T>
+// __device__ __forceinline__ T ceil_up(T x, T y) {
+//     return (x + y - 1) / y * y;
+// }
+
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumRdmaRanks, int kNumExperts, int kTopk, int kNumQPs>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
@@ -68,6 +73,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                                      (kUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     // rdma_index_source, topk_weight, hidden, (scale)
     const size_t num_bytes_per_msg_rdma_revecier_and_nvl_sender = sizeof(int4) + (kUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    // const size_t NVL_BUFFER_X_BYTES = ceil_up(kNumLocalExperts * kNumRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_rdma_revecier_and_nvl_sender, sizeof(int4));
     const size_t NVL_BUFFER_X_BYTES = kNumLocalExperts * kNumRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_rdma_revecier_and_nvl_sender;
     const size_t num_bytes_per_msg_rdma_to_nvl = kUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
@@ -76,6 +82,28 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
     EP_DEVICE_ASSERT(num_bytes_per_msg_rdma_revecier_and_nvl_sender % sizeof(int4) == 0);
     EP_DEVICE_ASSERT(num_bytes_per_msg_rdma_to_nvl % sizeof(int4) == 0);
+
+    // if (sm_id == 0 && thread_id == 0) {
+    //     // num_experts + num_rdma_ranks * 3 + num_rdma_experts + num_rdma_ranks * kNumQPs
+    //     // kNumExperts + kNumRdmaRanks * 3 + kNumRdmaExperts + kNumRdmaRanks * kNumQPs
+    //     for (int i = 0; i < kNumExperts + kNumRdmaRanks * 3 + kNumRdmaExperts + kNumRdmaRanks * kNumQPs; i++) {
+    //         if (atomic_counter_per_expert[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_counter_per_expert[%d]: %d\n", nvl_rank, i, atomic_counter_per_expert[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks * kNumQPs; i++) {
+    //         if (rdma_recv_count[i] != 0) {
+    //             printf("rank: %d, dispatch error rdma_recv_count[%d]: %d\n", nvl_rank, i, rdma_recv_count[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //         if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
+    //             printf("rank: %d, dispatch error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //         }
+    //     }
+    // }
+    // cg::this_grid().sync();
+    // sleep(10);
 
     /* RDMA Sender */
     // 每个sm负责一个token，每个warp负责一个rdma rank
@@ -336,7 +364,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         for (int rdma_recv_token_idx = sub_rdma_rank; rdma_recv_token_idx < num_recv_tokens_per_rdma; rdma_recv_token_idx += sms_per_rdma) {
             // index_source, nvl_num, hidden, (scale), nvl_rank0, dst_idx0, ..., nvl_rank7, dst_idx7
             const auto rdma_recv_x_uint8_now = rdma_recv_x_uint8 + rdma_recv_token_idx * num_bytes_per_msg;
-            const auto rdma_recv_x_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8_now);
+            // const auto rdma_recv_x_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8_now);
             const auto src_data = reinterpret_cast<int4*>(rdma_recv_x_uint8_now); // copy all
             const auto rdma_recv_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + sizeof(int4) + hidden_bytes);
             const auto rdma_recv_nvl_rank_meta = reinterpret_cast<int*>(rdma_recv_x_scales + (kUseFP8 ? kNumScales : 0));
@@ -460,6 +488,13 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     }
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0 && nvl_rank == 0) {
+    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //         printf("rank: %d, dispatch end, nvl flag, NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
 
 }
 
@@ -487,7 +522,7 @@ void dispatch(void* packed_recv_x,
     constexpr int kNumMaxTopK = 8;
     constexpr int kNumWarpsPerGroup = 32;
     constexpr int kNumWarpGroups = 1;
-    constexpr int kNumQPs = 32;
+    constexpr int kNumQPs = 32; // 32
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
@@ -562,9 +597,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     const size_t num_bytes_per_msg_dispatch = sizeof(int4) + 
                                               (kNumRdmaRanks * (kTopk * 3 + 1) * sizeof(int) + sizeof(int4) - 1) / sizeof(int4) * sizeof(int4) + 
                                               (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
-    // const size_t num_int4_per_msg_dispatch = num_bytes_per_msg_dispatch / sizeof(int4);
-    // const size_t num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch = sizeof(int4) + (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
-    // const size_t num_int4_per_msg_rdma_revecier_and_nvl_sender_dispatch = num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch / sizeof(int4);
+    const size_t num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch = sizeof(int4) + (kDispatchUseFP8 ? (kHidden + kNumScales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
 
     const size_t dispatch_hidden_bytes = kHidden * (kDispatchUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t combine_hidden_bytes = kHidden * sizeof(nv_bfloat16);
@@ -597,8 +630,32 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     const size_t hidden_bf16_int4 = kHidden / kNumElemsPerInt4;
 
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
-    const size_t NVL_BUFFER_X_BYTES = kNumRdmaExperts * kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
-
+    // const size_t DISPATCH_NVL_BUFFER_X_BYTES = ceil_up(kNumLocalExperts * kNumRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch, sizeof(int4)) + 
+    //                                            ceil_up(kNumExperts * sizeof(int), sizeof(int4));
+    // const size_t COMBINE_NVL_BUFFER_X_BYTES = ceil_up(kNumRdmaExperts * kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot, sizeof(int4));
+    const size_t DISPATCH_NVL_BUFFER_X_BYTES = kNumLocalExperts * kNumRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_rdma_revecier_and_nvl_sender_dispatch + 
+                                               kNumExperts * sizeof(int);
+    const size_t COMBINE_NVL_BUFFER_X_BYTES = kNumRdmaExperts * kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
+    const size_t NVL_BUFFER_X_BYTES = DISPATCH_NVL_BUFFER_X_BYTES + COMBINE_NVL_BUFFER_X_BYTES;
+    // if (sm_id == 0 && thread_id == 0) {
+    //     for (int i = 0; i < kNumExperts + kNumRdmaRanks; i++) {
+    //         if (atomic_clean_flag[i] != 0) {
+    //             printf("rank: %d, combine error atomic_clean_flag[%d]: %d\n", nvl_rank, i, atomic_clean_flag[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks * kNumQPs; i++) {
+    //         if (rdma_recv_flag[i] != 0) {
+    //             printf("rank: %d, combine error rdma_recv_flag[%d]: %d\n", nvl_rank, i, rdma_recv_flag[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //         if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
+    //             printf("rank: %d, combine error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //         }
+    //     }
+    // }
+    // cg::this_grid().sync();
+    // sleep(10);
     // // Clean up next buffer
     // if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
     //     #pragma unroll
@@ -635,7 +692,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
             const int *src_idxs = local_src_info + idx_now;
             const int dst_rdma_index = src_idxs[0];
             // nvl recv buffer
-            const auto dst_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[dst_nvl_rank]) + 
+            const auto dst_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[dst_nvl_rank]) + DISPATCH_NVL_BUFFER_X_BYTES +
                                 ((global_rdma_expert_idx * kNumRdmaRanks + dst_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_rdma_index) * num_bytes_per_slot);
             const auto x_int4 = local_x + idx_now * hidden_bf16_int4;
             UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_ptr, x_int4, ld_nc_global, st_na_global);
@@ -698,7 +755,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                     //     printf("nvl_rank_nums: %d, nvl_rank_idx: %d, token_id: %d, dst_rdma_expert_idx: %d, dst_cum_index: %d, topk_weight: %f, index_source: %d\n", 
                     //             nvl_rank_nums, nvl_rank_idx, rdma_recv_token_idx, dst_rdma_expert_idx, dst_cum_index, topk_weight, index_source);   
                     // }
-                    const int4 *src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + 
+                    const int4 *src_ptr = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + DISPATCH_NVL_BUFFER_X_BYTES +
                                           ((dst_rdma_expert_idx * kNumRdmaRanks + deal_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_cum_index) * num_bytes_per_slot);
                     // reduce
                     auto x_vec = ld_nc_global(src_ptr + thread_id);
@@ -763,7 +820,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         // all sms reduce done
         if (sub_deal_rdma_rank == 0 && thread_id == 0) {
             while (ld_acquire_global(atomic_nvl_sender_multi_sms + deal_rdma_rank) != sms_per_rdma);
-            atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0
+            atomic_nvl_sender_multi_sms[deal_rdma_rank] = 0;
         }
         __syncthreads();
         // set flag
@@ -832,6 +889,13 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
         }
     }
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0 && nvl_rank == 0) {
+    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //         printf("rank: %d, combine end, nvl flag, NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
 }
 
 void combine(void* combined_x,
@@ -850,7 +914,7 @@ void combine(void* combined_x,
     constexpr int kNumWarpsPerGroup = 32;
     constexpr int kNumWarpGroups = 1;
     constexpr int kNumMaxTopk = 8;
-    constexpr int kNumQPs = 4;
+    constexpr int kNumQPs = 4; // 4
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const int dev_id = 0;

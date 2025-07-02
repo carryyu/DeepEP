@@ -247,17 +247,30 @@ size_t get_low_latency_rdma_size_hint_two_stage(int num_max_dispatch_tokens_per_
     return ((rdma_num_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
+// template<typename T>
+// T div_up(T x, T y) {
+//     return (x + y - 1) / y * y;
+// }
+
 size_t get_low_latency_nvl_size_hint_two_stage(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts, int num_topk, bool use_fp8) {
     const int num_local_experts = num_experts / num_ranks;
     const int num_rdma_experts = num_local_experts * NUM_MAX_NVL_PEERS;
     const int num_scales = hidden / 128;
     const int num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     const size_t dispatch_num_bytes_per_msg = sizeof(int4) + (use_fp8 ? (hidden + num_scales * sizeof(float)) : (hidden * sizeof(nv_bfloat16)));
-    auto dispatch_nvl_num_bytes = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * dispatch_num_bytes_per_msg + num_local_experts * num_ranks * sizeof(int);
+    auto dispatch_nvl_num_bytes = num_local_experts * num_ranks * num_max_dispatch_tokens_per_rank * dispatch_num_bytes_per_msg;
     const size_t combine_num_bytes_per_msg = hidden * sizeof(nv_bfloat16);
-    auto combine_nvl_num_bytes = num_rdma_experts * num_rdma_ranks * num_max_dispatch_tokens_per_rank * combine_num_bytes_per_msg + num_rdma_experts * num_rdma_ranks * sizeof(int);
-    auto nvl_num_bytes = std::max(dispatch_nvl_num_bytes, combine_nvl_num_bytes);
-    return ((nvl_num_bytes + NUM_BUFFER_ALIGNMENT_BYTES - 1) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
+    auto combine_nvl_num_bytes = num_rdma_experts * num_rdma_ranks * num_max_dispatch_tokens_per_rank * combine_num_bytes_per_msg;
+    const size_t signal_bytes = num_local_experts * num_ranks * sizeof(int);
+    // auto nvl_num_bytes = div_up(dispatch_nvl_num_bytes, sizeof(int4)) + 
+    //                      div_up(signal_bytes, sizeof(int4)) + 
+    //                      div_up(combine_nvl_num_bytes, sizeof(int4)) + 
+    //                      div_up(signal_bytes, sizeof(int4));
+    auto nvl_num_bytes = dispatch_nvl_num_bytes + 
+                         signal_bytes + 
+                         combine_nvl_num_bytes + 
+                         signal_bytes;
+    return nvl_num_bytes;
 }
 
 } // namespace deep_ep

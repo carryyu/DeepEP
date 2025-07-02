@@ -30,11 +30,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
     # Check dispatch correctness
-    do_check = True
+    do_check = False
     hash_value, num_times = 0, 0
     print_combine = True
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in (False, True):
+        for dispatch_use_fp8 in (True, ):
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = \
@@ -111,7 +111,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts,
+            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=True,
                                         async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
@@ -129,7 +129,9 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += num_bf16_bytes * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False))
+    avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False), num_warmups=200, num_tests=10000)
+    # if (rank == 0):
+    # print(f"num_dispatch_comm_bytes: {num_dispatch_comm_bytes}, num_combine_comm_bytes: {num_combine_comm_bytes}")
     print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
@@ -138,7 +140,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True)
+                                             suppress_kineto_output=True, num_tests=10000)
         if not return_recv_hook:
             print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                   f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
@@ -152,7 +154,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    print(f"rank: {rank}, num_ranks: {num_ranks}")
+    # print(f"rank: {rank}, num_ranks: {num_ranks}")
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 64
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)

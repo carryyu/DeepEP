@@ -4,6 +4,8 @@ import torch.distributed as dist
 from functools import partial
 
 import time
+import numpy as np
+import copy
 
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
@@ -48,10 +50,14 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     group.barrier()
     do_check = True
     hash_value, num_times = 0, 0
-    warp_up_time = 200
-    all_times = 10000
+    all_times = 100
+    warp_up_time = 0
+    dispatch_times = []
+    combine_times = []
     for return_recv_hook in (False, ):
-        for dispatch_use_fp8 in (False, ): # True False
+        for dispatch_use_fp8 in (True, ): # True False
+            print("dispatch_use_fp8: ", dispatch_use_fp8)
+            ############dispatch#############
             num_times += 1
             # for i in range((num_times % 2) + 1):
             # if (rank == 0 or rank == 8):
@@ -64,12 +70,49 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 # print("num_experts: ", num_experts)
                 # print("-------------------end-------------------")
             for i in range(all_times):
-                # if rank == 0:
-                    # print("dispatch i: ", i)
-                if i == warp_up_time:
-                    torch.cuda.synchronize()
-                    group.barrier()
-                    s_time = time.time()
+                if rank == 0 or rank == 8:
+                    print("dispatch i: ", i)
+                packed_recv_x, packed_recv_count, rdma_send_flags, handle, event, hook = \
+                    buffer.low_latency_dispatch_two_stage(
+                        x, 
+                        topk_idx, 
+                        topk_weights,
+                        # x_copy,
+                        # topk_idx_copy,
+                        # topk_weights_copy,
+                        num_tokens, 
+                        num_experts, 
+                        use_fp8=dispatch_use_fp8,
+                        async_finish=not return_recv_hook, 
+                        return_recv_hook=return_recv_hook)
+                packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
+                # time.sleep(5)
+                # torch.cuda.synchronize()
+                # group.barrier()
+            # for i in range(all_times):
+                ############combine#############
+                if rank == 0 or rank == 8:
+                    print("combine i: ", i)
+                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                if dispatch_use_fp8:
+                    simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
+                else:
+                    simulated_gemm_x = packed_recv_x.clone()
+                # if (rank == 0 or rank == 8):
+                #     print(f"rank: {rank}, simulated_gemm_x: {simulated_gemm_x}", flush=True)
+                combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                        async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
+                                                                        return_recv_hook=return_recv_hook, out=out)
+                if (rank == 0 or rank == 8):
+                    print(f"rank: {rank}, combined_x: {combined_x.dtype, combined_x.shape, combined_x}", flush=True)
+                # time.sleep(5)
+                # torch.cuda.synchronize()
+                # group.barrier()
+            # print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / np.mean(np.array(dispatch_times)):.2f} GB/s, avg_t={np.mean(np.array(dispatch_times)) * 1e6:.2f} us, run_time: {len(dispatch_times)}', flush=True)
+            # print(f'[rank {rank}] combine bandwidth: {num_combine_comm_bytes / 1e9 / np.mean(np.array(combine_times)):.2f} GB/s, avg_t={np.mean(np.array(combine_times)) * 1e6:.2f} us, run_time: {len(combine_times)}', flush=True)
+            # print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / (np.mean(np.array(dispatch_times)) + np.mean(np.array(combine_times))):.2f} GB/s, ', flush=True)
+            
+            def test_func(return_recv_hook: bool):
                 packed_recv_x, packed_recv_count, rdma_send_flags, handle, event, hook = \
                     buffer.low_latency_dispatch_two_stage(
                         x, 
@@ -80,77 +123,19 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         use_fp8=dispatch_use_fp8,
                         async_finish=not return_recv_hook, 
                         return_recv_hook=return_recv_hook)
-            # hook() if return_recv_hook else event.current_stream_wait()
-            torch.cuda.synchronize()
-            group.barrier()
-            e_time = time.time()
-            dispatch_time = (e_time - s_time) / (all_times - warp_up_time)
-            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_time:.2f} GB/s, avg_t={dispatch_time * 1e6:.2f} us', flush=True)
-            packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
-            # if (rank == 0 or rank == 8):
-            # # if True:
-            #     src_info, layout_range, rdma_send_flags, packed_rdma_recv_count, dispatch_rdma_recv_tensor, dispatch_rdma_recv_count_tensor, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-            #     if dispatch_use_fp8:
-            #         # print("packed_recv_x: ", packed_recv_x[0])
-            #         print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags}")
-            #         for rank_i in range(num_local_experts):
-            #             print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[0][rank_i][:(packed_recv_count[rank_i] + 1)]}, recv_scale: {packed_recv_x[1][rank_i][:(packed_recv_count[rank_i] + 1)]}")
-            #             # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
-            #     else:
-            #         # print("packed_recv_x: ", packed_recv_x)
-            #         for rank_i in range(num_local_experts):
-            #             print(f"rank: {rank}, local_expert_idx: {rank_i}, recv_x_num: {packed_recv_count[rank_i]}, recv_x: {packed_recv_x[rank_i][:(packed_recv_count[rank_i] + 1)]}")
-            #             # print(f"rank: {rank}, src_info {rank_i}: {src_info.shape, src_info[rank_i, :(packed_recv_count[rank_i] + 1)]}")
-            #     print(f"rank: {rank}, layout_range: {layout_range.shape, layout_range}")
-            #     print(f"rank: {rank}, rdma_send_flags: {rdma_send_flags.shape, rdma_send_flags.reshape([-1])}")
-            #     max_limit = -(num_rdma_ranks * (8 * 3 + 1) * 2)
-            #     print(f"rank: {rank}, dispatch_rdma_recv_tensor: {dispatch_rdma_recv_tensor.shape, dispatch_rdma_recv_tensor[:, :, 8:-max_limit]}")
-            #     print(f"rank: {rank}, dispatch_rdma_recv_count_tensor: {dispatch_rdma_recv_count_tensor.shape, dispatch_rdma_recv_count_tensor}")
-            #     print(f"rank: {rank}, packed_rdma_recv_count: {packed_rdma_recv_count}")
-            #     print(f"rank: {rank}, num_max_dispatch_tokens_per_rank: {num_max_dispatch_tokens_per_rank}, hidden: {hidden}, num_experts: {num_experts}")
-            
-            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-            # simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
-            #     if dispatch_use_fp8 else packed_recv_x.clone()
-            if dispatch_use_fp8:
-                # print("packed_recv_x[0]: ", packed_recv_x[0].shape, packed_recv_x[0])
-                # print("packed_recv_x0 view: ", packed_recv_x[0].view(-1, hidden))
-                # print("packed_recv_x[1]: ", packed_recv_x[1].shape, packed_recv_x[1])
-                # print("packed_recv_x1 view: ", packed_recv_x[1].view(-1, hidden // 128))
-                simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape)
-            else:
-                simulated_gemm_x = packed_recv_x.clone()
-            # if rank == 0:
-            #     print('-------------------simulated_gemm_x-------------------')
-            #     print(f"rank: {rank}, simulated_gemm_x: {simulated_gemm_x.dtype, simulated_gemm_x.shape, simulated_gemm_x}", flush=True)
-            #     print('-------------------end-------------------')
-            for i in range(all_times):
-                # if rank == 0:
-                    # print("combine i: ", i)
-                if i == warp_up_time:
-                    torch.cuda.synchronize()
-                    group.barrier()
-                    s_time = time.time()
-                # if (rank == 0):
-                #     print("packed_recv_x: ", packed_recv_x)
-                #     print("simulated_gemm_x: ", simulated_gemm_x)
-                #     print("topk_idx: ", topk_idx)
-                #     print("topk_weights: ", topk_weights)
-                #     print("handle: ", handle)
-                #     print("return_recv_hook: ", return_recv_hook)
-                #     print("async_finish: ", not return_recv_hook)
-                #     print("dispatch_use_fp8: ", dispatch_use_fp8)
                 combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                         async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
                                                                         return_recv_hook=return_recv_hook, out=out)
-            torch.cuda.synchronize()
-            group.barrier()
-            e_time = time.time()
-            combine_time = (e_time - s_time) / (all_times - warp_up_time)
-            if (rank == 0 or rank == 8):
-                print(f"rank: {rank}, combined_x: {combined_x.dtype, combined_x.shape, combined_x}", flush=True)
-            print(f'[rank {rank}] combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_time:.2f} GB/s, avg_t={combine_time * 1e6:.2f} us', flush=True)
-            print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / (dispatch_time + combine_time):.2f} GB/s, ', flush=True)
+            # dispatch + combine
+            avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False), num_warmups=50, num_tests=50)  
+            print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
+                  f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)   
+            # dispatch / combine
+            dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=False),
+                                             kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                                             suppress_kineto_output=True, num_tests=30)
+            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                  f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
     return hash_value
 
 
@@ -161,7 +146,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_rdma_ranks = num_ranks / 8
     num_local_experts = num_experts / num_ranks
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint_two_stage(num_tokens, hidden, num_ranks, num_experts, num_topk)
-    use_fp8 = False
+    use_fp8 = True
     # nvl_recv_x: num_local_experts * dp_num * num_max_token_per_dp * hidden_size
     # nvl_recv_count: num_local_experts * dp_num
     num_nvl_bytes = deep_ep.Buffer.get_low_latency_nvl_size_hint_two_stage(num_tokens, hidden, num_ranks, num_experts, num_topk, use_fp8)

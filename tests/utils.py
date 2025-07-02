@@ -71,7 +71,8 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
     return (scores * mask).view(num_tokens, num_experts)
 
 
-def bench(fn, num_warmups: int = 200, num_tests: int = 9800, post_fn=None):
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+    print(f"bench num_warmups: {num_warmups}, num_tests: {num_tests}")
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
@@ -96,6 +97,13 @@ def bench(fn, num_warmups: int = 200, num_tests: int = 9800, post_fn=None):
     torch.cuda.synchronize()
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
+    print("run_times: ", len(times))
+    print("p40: {}us".format(np.percentile(times, 40) * 1e6))
+    print("p50: {}us".format(np.percentile(times, 50) * 1e6))
+    print("p60: {}us".format(np.percentile(times, 60) * 1e6))
+    print("p70: {}us".format(np.percentile(times, 70) * 1e6))
+    print("p80: {}us".format(np.percentile(times, 80) * 1e6))
+    print("p90: {}us".format(np.percentile(times, 90) * 1e6))
     return np.average(times), np.min(times), np.max(times)
 
 
@@ -142,9 +150,10 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
-def bench_kineto(fn, kernel_names, num_tests: int = 10000, suppress_kineto_output: bool = False,
+def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None, barrier_comm_profiling: bool = False):
     # Profile
+    print("bench_kineto num_tests: ", num_tests)
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
@@ -156,7 +165,8 @@ def bench_kineto(fn, kernel_names, num_tests: int = 10000, suppress_kineto_outpu
                     rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
-                for _ in range(num_tests):
+                for test_i in range(num_tests):
+                    print("test_i: ", test_i)
                     fn()
                 prof.step()
 

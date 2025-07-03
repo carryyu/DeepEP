@@ -86,21 +86,52 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     // if (sm_id == 0 && thread_id == 0) {
     //     // num_experts + num_rdma_ranks * 3 + num_rdma_experts + num_rdma_ranks * kNumQPs
     //     // kNumExperts + kNumRdmaRanks * 3 + kNumRdmaExperts + kNumRdmaRanks * kNumQPs
-    //     for (int i = 0; i < kNumExperts + kNumRdmaRanks * 3 + kNumRdmaExperts + kNumRdmaRanks * kNumQPs; i++) {
+    //     for (int i = 0; i < kNumExperts; i++) {
     //         if (atomic_counter_per_expert[i] != 0) {
     //             printf("rank: %d, dispatch error atomic_counter_per_expert[%d]: %d\n", nvl_rank, i, atomic_counter_per_expert[i]);
     //         }
     //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_counter_per_rdma[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_counter_per_rdma[%d]: %d\n", nvl_rank, i, atomic_counter_per_rdma[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_finished_counter_per_rdma[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_finished_counter_per_rdma[%d]: %d\n", nvl_rank, i, atomic_finished_counter_per_rdma[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaExperts; i++) {
+    //         if (atomic_recv_tokens_per_rdma_expert[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_recv_tokens_per_rdma_expert[%d]: %d\n", nvl_rank, i, atomic_recv_tokens_per_rdma_expert[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_nvl_sender_multi_sms[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_nvl_sender_multi_sms[%d]: %d\n", nvl_rank, i, atomic_nvl_sender_multi_sms[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks * kNumQPs; i++) {
+    //         if (atomic_counter_per_qp[i] != 0) {
+    //             printf("rank: %d, dispatch error atomic_counter_per_qp[%d]: %d\n", nvl_rank, i, atomic_counter_per_qp[i]);
+    //         }
+    //     }
+
     //     for (int i = 0; i < kNumRdmaRanks * kNumQPs; i++) {
     //         if (rdma_recv_count[i] != 0) {
     //             printf("rank: %d, dispatch error rdma_recv_count[%d]: %d\n", nvl_rank, i, rdma_recv_count[i]);
     //         }
     //     }
-    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
-    //         if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
-    //             printf("rank: %d, dispatch error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     for (int i = 0; i < num_next_clean_int; i++) {
+    //         if (next_clean[i] != 0) {
+    //             printf("rank: %d, dispatch error next_clean[%d]: %d\n", nvl_rank, i, next_clean[i]);
     //         }
     //     }
+    //     // for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //     //     if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
+    //     //         printf("rank: %d, dispatch error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     //     }
+    //     // }
     // }
     // cg::this_grid().sync();
     // sleep(10);
@@ -334,11 +365,15 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     // 注意：如果目标专家们在同一个卡上，会通过nvlink重复发送，原低时延实现同样如此，可能存在优化空间!!!
     {
         const int sms_per_rdma = num_sms / kNumRdmaRanks; // 多少个sms一起处理一个rdma ranks
+        EP_DEVICE_ASSERT(num_sms % kNumRdmaRanks == 0);
         const int src_rdma_rank = sm_id / sms_per_rdma; // 处理收到的那个rdma rank的数据
         const int sub_rdma_rank = sm_id % sms_per_rdma;
 
         const int src_rank = src_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank;
         const auto rdma_recv_x_uint8 = reinterpret_cast<uint8_t*>(rdma_recv_x) +
+                src_rdma_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
+        const auto rdma_recv_x_uint8_bak = reinterpret_cast<uint8_t*>(rdma_recv_x) + 
+                kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                 src_rdma_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
 
         __shared__ int shared_num_recv_tokens[1];
@@ -364,12 +399,21 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
         for (int rdma_recv_token_idx = sub_rdma_rank; rdma_recv_token_idx < num_recv_tokens_per_rdma; rdma_recv_token_idx += sms_per_rdma) {
             // index_source, nvl_num, hidden, (scale), nvl_rank0, dst_idx0, ..., nvl_rank7, dst_idx7
             const auto rdma_recv_x_uint8_now = rdma_recv_x_uint8 + rdma_recv_token_idx * num_bytes_per_msg;
+            const auto rdma_recv_x_uint8_bak_now = rdma_recv_x_uint8_bak + rdma_recv_token_idx * num_bytes_per_msg;
             // const auto rdma_recv_x_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8_now);
             const auto src_data = reinterpret_cast<int4*>(rdma_recv_x_uint8_now); // copy all
             const auto rdma_recv_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + sizeof(int4) + hidden_bytes);
             const auto rdma_recv_nvl_rank_meta = reinterpret_cast<int*>(rdma_recv_x_scales + (kUseFP8 ? kNumScales : 0));
             const int dst_nvl_experts = *(rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1));
             const auto rdma_recv_nvl_rank_meta_now = rdma_recv_nvl_rank_meta + rdma_rank * (kTopk * 3 + 1) + 1;
+
+            // used in combine
+            // 防止combine使用的dispatch buffer被别的机器/卡执行dispatch时写污染
+            // 拷贝时一定是当前rank执行到这里
+            if (warp_id == num_warps - 1) {
+                // copy rdma_recv_x_uint8_now to rdma_recv_x_uint8_now_bak
+                UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg, reinterpret_cast<int4*>(rdma_recv_x_uint8_bak_now), reinterpret_cast<int4*>(rdma_recv_x_uint8_now), ld_nc_global, st_na_global);
+            }
 
             // 一个warp负责一个nvl expert的发送
             // 当目标专家在同一个nvl rank时，发送多次
@@ -388,6 +432,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                     st_na_global(rdma_dst_cumsum_idx, rdma_local_expert_cumsum_index);
                 }
                 UNROLLED_WARP_COPY(UNROLL_FACTOR, lane_id, num_int4_per_msg_rdma_to_nvl, dst_data + 1, src_data + 1, ld_nc_global, st_na_global);
+                __syncwarp();
                 // if (lane_id == 0 && src_rdma_rank == 0 && src_rank == 1 && dst_nvl_rank == 0 && dst_nvl_local_expert == 2) {
                 //     printf("rdma_recv_token_idx: %d, loop_nvl_expert_i: %d, src_rdma_rank: %d, src_rank: %d, nvl_rank: %d, dst_nvl_rank: %d, dst_nvl_local_expert: %d, dst_nvl_experts: %d, rdma_local_expert_cumsum_index: %d\n", 
                 //             rdma_recv_token_idx, loop_nvl_expert_i, src_rdma_rank, src_rank, nvl_rank, dst_nvl_rank, dst_nvl_local_expert, dst_nvl_experts, rdma_local_expert_cumsum_index);
@@ -396,6 +441,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
                 lane_id == 0 ? (atomic_add_release_global(atomic_recv_tokens_per_rdma_expert + src_rdma_rank * kNumRdmaExperts + rdma_local_expert_idx, 1)) : 0;
             }
         }
+        __syncthreads();
         thread_id == 0 ? (atomic_add_release_global(atomic_nvl_sender_multi_sms + src_rdma_rank, 1)) : 0;
         // 确保所有sm处理完
         if (sub_rdma_rank == 0 && thread_id == 0) {
@@ -403,6 +449,7 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
             atomic_nvl_sender_multi_sms[src_rdma_rank] = 0;
         }
         __syncthreads();
+        // cg::this_grid().sync();
         // 设置对端标志位
         if (sub_rdma_rank == 0) {
             for (int dst_rdma_local_expert_idx = thread_id; dst_rdma_local_expert_idx < NUM_MAX_NVL_PEERS * kNumLocalExperts; dst_rdma_local_expert_idx += num_threads) {
@@ -492,6 +539,41 @@ dispatch_kernel(void* packed_recv_x, float* packed_recv_x_scales,
     // if (sm_id == 0 && thread_id == 0 && nvl_rank == 0) {
     //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
     //         printf("rank: %d, dispatch end, nvl flag, NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_x[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0) {
+    //     // num_experts + num_rdma_ranks * 3 + num_rdma_experts + num_rdma_ranks * kNumQPs
+    //     // kNumExperts + kNumRdmaRanks * 3 + kNumRdmaExperts + kNumRdmaRanks * kNumQPs
+    //     for (int i = 0; i < kNumExperts; i++) {
+    //         if (atomic_counter_per_expert[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_counter_per_expert[%d]: %d\n", nvl_rank, i, atomic_counter_per_expert[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_counter_per_rdma[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_counter_per_rdma[%d]: %d\n", nvl_rank, i, atomic_counter_per_rdma[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_finished_counter_per_rdma[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_finished_counter_per_rdma[%d]: %d\n", nvl_rank, i, atomic_finished_counter_per_rdma[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaExperts; i++) {
+    //         if (atomic_recv_tokens_per_rdma_expert[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_recv_tokens_per_rdma_expert[%d]: %d\n", nvl_rank, i, atomic_recv_tokens_per_rdma_expert[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks; i++) {
+    //         if (atomic_nvl_sender_multi_sms[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_nvl_sender_multi_sms[%d]: %d\n", nvl_rank, i, atomic_nvl_sender_multi_sms[i]);
+    //         }
+    //     }
+    //     for (int i = 0; i < kNumRdmaRanks * kNumQPs; i++) {
+    //         if (atomic_counter_per_qp[i] != 0) {
+    //             printf("rank: %d, dispatch end error atomic_counter_per_qp[%d]: %d\n", nvl_rank, i, atomic_counter_per_qp[i]);
+    //         }
     //     }
     // }
     // cg::this_grid().sync();
@@ -648,11 +730,16 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     //             printf("rank: %d, combine error rdma_recv_flag[%d]: %d\n", nvl_rank, i, rdma_recv_flag[i]);
     //         }
     //     }
-    //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
-    //         if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
-    //             printf("rank: %d, combine error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     for (int i = 0; i < num_next_clean_int; i++) {
+    //         if (next_clean[i] != 0) {
+    //             printf("rank: %d, dispatch error next_clean[%d]: %d\n", nvl_rank, i, next_clean[i]);
     //         }
     //     }
+    //     // for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
+    //     //     if (reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i] != 0) {
+    //     //         printf("rank: %d, combine error NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     //     }
+    //     // }
     // }
     // cg::this_grid().sync();
     // sleep(10);
@@ -696,6 +783,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
                                 ((global_rdma_expert_idx * kNumRdmaRanks + dst_rdma_rank) * num_max_dispatch_tokens_per_rank + dst_rdma_index) * num_bytes_per_slot);
             const auto x_int4 = local_x + idx_now * hidden_bf16_int4;
             UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_ptr, x_int4, ld_nc_global, st_na_global);
+            __syncwarp();
         }
         // Put nvl finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
@@ -733,6 +821,7 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
         //     printf("num_tokens_to_deal: %d\n", num_tokens_to_deal);
         // }
         const auto dispatch_rdma_recv_x_this_rdma_rank = reinterpret_cast<uint8_t*>(dispatch_rdma_recv_x) + 
+                                                         kNumRdmaRanks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_dispatch +
                                                          deal_rdma_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg_dispatch;
         auto rdma_send_x_this_rdma_rank = reinterpret_cast<uint8_t*>(rdma_send_x) + 
                                                 deal_rdma_rank * num_max_dispatch_tokens_per_rank * combine_hidden_bytes;
@@ -893,6 +982,14 @@ combine_kernel(void* combined_x, // 结果 num_combined_tokens * kHidden
     // if (sm_id == 0 && thread_id == 0 && nvl_rank == 0) {
     //     for (int i = 0; i < kNumLocalExperts * kNumRanks; i++) {
     //         printf("rank: %d, combine end, nvl flag, NVL_BUFFER_X_BYTES: %d, nvl_recv_count[%d]: %d\n", nvl_rank, (int)NVL_BUFFER_X_BYTES, i, reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(nvl_recv_buffer[nvl_rank]) + NVL_BUFFER_X_BYTES)[i]);
+    //     }
+    // }
+    // cg::this_grid().sync();
+    // if (sm_id == 0 && thread_id == 0) {
+    //     for (int i = 0; i < kNumExperts + kNumRdmaRanks; i++) {
+    //         if (atomic_clean_flag[i] != 0) {
+    //             printf("rank: %d, combine end error atomic_clean_flag[%d]: %d\n", nvl_rank, i, atomic_clean_flag[i]);
+    //         }
     //     }
     // }
     // cg::this_grid().sync();

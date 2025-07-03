@@ -144,6 +144,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         if not return_recv_hook:
             print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                   f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+            print(f'[rank {rank}] Dispatch + combine bandwidth111: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / (dispatch_t + combine_t):.2f} GB/s, avg_t={(dispatch_t + combine_t) * 1e6:.2f} us', flush=True) 
         else:
             print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
                   f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
@@ -155,7 +156,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     # print(f"rank: {rank}, num_ranks: {num_ranks}")
-    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 64
+    num_tokens, hidden, num_topk, num_experts = 512, 7168, 8, 64
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:

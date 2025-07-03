@@ -154,7 +154,8 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         best_time, best_results = 1e10, None
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
         for nvl_chunk_size in range(4, 33, 4):
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+            # config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size)
+            config = deep_ep.Config(num_sms, 256, 2560) # !!!
             tune_args = {'x': current_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.dispatch(**tune_args))[0]
             if t < best_time:

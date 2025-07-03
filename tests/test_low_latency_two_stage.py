@@ -122,7 +122,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 combined_x, event, hook = buffer.low_latency_combine_two_stage(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                         async_finish=not return_recv_hook, dispatch_use_fp8=dispatch_use_fp8,
                                                                         return_recv_hook=return_recv_hook, out=out)
-            dispatch + combine
+            # dispatch + combine
             avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False), num_warmups=200, num_tests=10000)  
             print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
                   f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)   

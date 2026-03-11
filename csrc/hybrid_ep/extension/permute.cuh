@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #pragma once
-#include <ATen/cuda/CUDAContext.h>
+// #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <torch/torch.h>
+// #include <torch/torch.h>
+#include <torch/python.h>
 #include <cub/cub.cuh>
 #include <type_traits>
 #include "utils.cuh"
@@ -39,7 +40,7 @@ struct PermuteArgs {
 struct UnpermuteArgs {
   // Input tensors
   torch::Tensor permuted_tokens;
-  c10::optional<torch::Tensor> permuted_probs;
+  std::optional<torch::Tensor> permuted_probs;
   torch::Tensor row_id_map;
 
   // The address of the output
@@ -103,7 +104,7 @@ struct UnpermuteArgs {
   * num_of_local_experts], type: ProbType, now only support float
   */
  template <typename DType, typename ProbType, typename ScalarType>
- std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
+ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>>
  permute_launcher(PermuteArgs args);
  
  /**
